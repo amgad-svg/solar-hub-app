@@ -9,7 +9,6 @@ from flask import Flask, render_template_string, request, redirect, url_for, fla
 app = Flask(__name__)
 app.secret_key = 'solar_hub_secure_cloud_ultimate_2026'
 
-# تأكيد مسار قاعدة البيانات ليعمل بكفاءة على السيرفر السحابي
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, 'solar_hub.db')
 BACKUP_FOLDER = os.path.join(BASE_DIR, 'backups')
@@ -28,12 +27,20 @@ def backup_database():
         backup_filename = f"solar_hub_backup_{date_str}.db"
         backup_path = os.path.join(BACKUP_FOLDER, backup_filename)
         shutil.copyfile(DB_FILE, backup_path)
-        print(f"SUCCESS: Backup created: {backup_filename}")
-    except Exception as e:
-        print(f"Backup Error: {str(e)}")
+    except:
+        pass
 
 def init_db():
     with get_db_connection() as conn:
+        # إنشاء الجداول والتأكد من وجودها إجبارياً لمنع خطأ no such table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL
+            )
+        ''')
         conn.execute('''
             CREATE TABLE IF NOT EXISTS inventory (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
@@ -60,29 +67,20 @@ def init_db():
                 phone TEXT NOT NULL, project TEXT NOT NULL, status TEXT NOT NULL
             )
         ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL
-            )
-        ''')
         
-        # إضافة الحساب الأساسي لأمجد كمدير للنظام
-        try:
+        # التأكد من وجود حساب أمجد الأساسي
+        user_check = conn.execute('SELECT COUNT(*) FROM users WHERE username = "amgad"').fetchone()[0]
+        if user_check == 0:
             conn.execute("INSERT INTO users (username, password, role) VALUES ('amgad', '123456', 'مدير')")
-        except sqlite3.IntegrityError:
-            pass
             
-        check_inv = conn.execute('SELECT COUNT(*) FROM inventory').fetchone()[0]
-        if check_inv == 0:
+        inv_check = conn.execute('SELECT COUNT(*) FROM inventory').fetchone()[0]
+        if inv_check == 0:
             conn.execute("INSERT INTO inventory VALUES ('101', 'لوح جينكو شمسى 550 واط', 'ألواح', 50, 110.0, 150.0)")
             conn.execute("INSERT INTO inventory VALUES ('102', 'إنفيرتر ذكي 5 كيلو واط', 'إنفيرترات', 15, 400.0, 550.0)")
             conn.execute("INSERT INTO inventory VALUES ('103', 'بطارية جيل 200 أمبير', 'بطاريات', 30, 180.0, 240.0)")
         conn.commit()
 
-# واجهة تسجيل الدخول (Login Page)
+# واجهة تسجيل الدخول
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -149,14 +147,6 @@ def render_with_layout(active_page, main_content):
         </div>
     </div>
     """
-    
-    # تفريغ رسائل فلاش المخبأة
-    flash_messages_html = ""
-    try:
-        messages = request.cookies.get('flash') # تجنب تعليق الجلسة سحابياً
-    except:
-        messages = None
-
     BASE_HTML = f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
@@ -177,6 +167,7 @@ def render_with_layout(active_page, main_content):
 
 @app.route('/login', methods=['GET', 'POST'])
 def login_page():
+    init_db() # التأكد من تهيئة الجداول إجبارياً قبل فحص اسم المستخدم
     if request.method == 'POST':
         username = request.form.get('username').strip().lower()
         password = request.form.get('password').strip()
