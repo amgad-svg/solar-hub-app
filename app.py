@@ -1,192 +1,165 @@
-import csv
-import html
-import io
-import json
 import os
 import re
-import secrets
+import csv
+import io
+import json
 import shutil
 import sqlite3
-import zipfile
-from datetime import datetime
-from functools import wraps
+import secrets
 from pathlib import Path
+from datetime import datetime, date
+from functools import wraps
 
 from flask import (
-    Flask,
-    Response,
-    abort,
-    flash,
-    g,
-    jsonify,
-    redirect,
-    render_template_string,
-    request,
-    send_file,
-    session,
-    url_for,
+    Flask, Response, abort, flash, g, jsonify, redirect,
+    render_template_string, request, session, url_for
 )
+from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 
-
-APP_NAME = "SolarPro ERP"
+APP_NAME = "إدارة الطاقة الشمسية"
+CURRENCY = "ج.س"
 ROLES = ("مدير", "محاسب", "فني تركيبات")
-
+STATUSES = ("قيد التنفيذ", "مكتمل")
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def resolve_database_path() -> Path:
-    explicit_path = os.environ.get("SQLITE_DB_PATH") or os.environ.get("DATABASE_PATH")
-    if explicit_path:
-        return Path(explicit_path).expanduser().resolve()
+def usable_dir(path: Path, fallback: Path) -> Path:
+    for p in (path, fallback):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return p
+        except Exception:
+            continue
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
-    render_disk = Path("/var/data")
-    if render_disk.exists() and os.access(render_disk, os.W_OK):
-        return render_disk / "solarpro.sqlite3"
 
-    data_dir = BASE_DIR / "data"
-    return data_dir / "solarpro.sqlite3"
-
-
-DB_PATH = resolve_database_path()
+DATA_DIR = (
+    Path(os.environ["DATA_DIR"]).expanduser()
+    if os.environ.get("DATA_DIR")
+    else usable_dir(Path("/var/data"), BASE_DIR / "instance")
+    if (Path("/var/data").exists() or os.environ.get("RENDER"))
+    else usable_dir(BASE_DIR / "instance", BASE_DIR)
+)
+DB_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "solar_system.sqlite3")).expanduser()
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", DATA_DIR / "backups")).expanduser()
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", str(DB_PATH.parent / "backups"))).expanduser().resolve()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-in-production-" + secrets.token_hex(16))
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "0") == "1",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"},
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 10,
     MAX_CONTENT_LENGTH=4 * 1024 * 1024,
 )
 
 
-def get_db() -> sqlite3.Connection:
+def get_db():
     if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        g.db = conn
+        con = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA busy_timeout=5000")
+        g.db = con
     return g.db
 
 
 @app.teardown_appcontext
-def close_db(_error=None):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+def close_db(_=None):
+    con = g.pop("db", None)
+    if con:
+        con.close()
 
 
 def init_db():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
+    with sqlite3.connect(DB_PATH, timeout=15) as con:
+        con.executescript("""
+        PRAGMA foreign_keys=ON;
+        PRAGMA journal_mode=WAL;
+
+        CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
-            role TEXT NOT NULL
+            role TEXT NOT NULL CHECK(role IN ('مدير','محاسب','فني تركيبات'))
         );
 
-        CREATE TABLE IF NOT EXISTS inventory (
+        CREATE TABLE IF NOT EXISTS inventory(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            category TEXT NOT NULL DEFAULT '',
-            qty INTEGER NOT NULL DEFAULT 0,
-            cost REAL NOT NULL DEFAULT 0,
-            price REAL NOT NULL DEFAULT 0
+            category TEXT NOT NULL DEFAULT 'عام',
+            qty INTEGER NOT NULL DEFAULT 0 CHECK(qty>=0),
+            cost REAL NOT NULL DEFAULT 0 CHECK(cost>=0),
+            price REAL NOT NULL DEFAULT 0 CHECK(price>=0)
         );
 
-        CREATE TABLE IF NOT EXISTS invoices (
+        CREATE TABLE IF NOT EXISTS invoices(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_name TEXT NOT NULL,
-            customer_phone TEXT NOT NULL DEFAULT '',
+            customer_phone TEXT,
             date TEXT NOT NULL,
-            labor_cost REAL NOT NULL DEFAULT 0,
-            expenses_cost REAL NOT NULL DEFAULT 0,
-            grand_total REAL NOT NULL DEFAULT 0
+            labor_cost REAL NOT NULL DEFAULT 0 CHECK(labor_cost>=0),
+            expenses_cost REAL NOT NULL DEFAULT 0 CHECK(expenses_cost>=0),
+            grand_total REAL NOT NULL DEFAULT 0 CHECK(grand_total>=0)
         );
 
-        CREATE TABLE IF NOT EXISTS invoice_items (
+        CREATE TABLE IF NOT EXISTS invoice_items(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invoice_id INTEGER NOT NULL,
             product_id INTEGER,
             product_name TEXT NOT NULL,
-            qty INTEGER NOT NULL,
-            price REAL NOT NULL DEFAULT 0,
-            cost REAL NOT NULL DEFAULT 0,
-            FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
-            FOREIGN KEY (product_id) REFERENCES inventory(id) ON DELETE SET NULL
+            qty INTEGER NOT NULL CHECK(qty>0),
+            price REAL NOT NULL CHECK(price>=0),
+            cost REAL NOT NULL CHECK(cost>=0),
+            FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+            FOREIGN KEY(product_id) REFERENCES inventory(id) ON DELETE SET NULL
         );
 
-        CREATE TABLE IF NOT EXISTS expenses (
+        CREATE TABLE IF NOT EXISTS expenses(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             description TEXT NOT NULL,
-            amount REAL NOT NULL DEFAULT 0,
-            category TEXT NOT NULL DEFAULT '',
+            amount REAL NOT NULL CHECK(amount>=0),
+            category TEXT NOT NULL DEFAULT 'عام',
             date TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS customers (
+        CREATE TABLE IF NOT EXISTS customers(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
-            phone TEXT NOT NULL DEFAULT '',
-            project_details TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'قيد التنفيذ'
+            phone TEXT,
+            project_details TEXT,
+            status TEXT NOT NULL CHECK(status IN ('مكتمل','قيد التنفيذ')) DEFAULT 'قيد التنفيذ'
         );
 
-        CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
         CREATE INDEX IF NOT EXISTS idx_inventory_name ON inventory(name);
-        CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(date);
+        CREATE INDEX IF NOT EXISTS idx_invoice_date ON invoices(date);
         CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON invoice_items(invoice_id);
-        CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
-        CREATE INDEX IF NOT EXISTS idx_customers_status ON customers(status);
-        """
-    )
-
-    existing = db.execute("SELECT id FROM users WHERE username = ?", ("amgad",)).fetchone()
-    if existing is None:
-        db.execute(
-            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-            ("amgad", generate_password_hash("123456"), "مدير"),
-        )
-
-    db.commit()
-    db.close()
+        CREATE INDEX IF NOT EXISTS idx_expense_date ON expenses(date);
+        CREATE INDEX IF NOT EXISTS idx_customer_status ON customers(status);
+        """)
+        if not con.execute("SELECT 1 FROM users WHERE username=?", ("amgad",)).fetchone():
+            con.execute(
+                "INSERT INTO users(username,password,role) VALUES(?,?,?)",
+                ("amgad", generate_password_hash("123456"), "مدير"),
+            )
+        con.commit()
 
 
-def backup_db_after_invoice():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    backup_name = f"solarpro_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.sqlite3"
-    backup_path = BACKUP_DIR / backup_name
-
-    source = sqlite3.connect(DB_PATH)
-    destination = sqlite3.connect(backup_path)
-    try:
-        source.backup(destination)
-    finally:
-        destination.close()
-        source.close()
-
-    backups = sorted(BACKUP_DIR.glob("solarpro_backup_*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old_backup in backups[30:]:
-        try:
-            old_backup.unlink()
-        except OSError:
-            pass
+with app.app_context():
+    init_db()
 
 
-def csrf_token() -> str:
-    if "_csrf_token" not in session:
-        session["_csrf_token"] = secrets.token_urlsafe(32)
+def csrf_token():
+    session.setdefault("_csrf_token", secrets.token_urlsafe(32))
     return session["_csrf_token"]
 
 
@@ -194,416 +167,292 @@ app.jinja_env.globals["csrf_token"] = csrf_token
 
 
 @app.before_request
-def protect_post_requests():
-    csrf_token()
+def csrf_guard():
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        submitted = (
-            request.form.get("_csrf_token")
-            or request.headers.get("X-CSRF-Token")
-            or request.headers.get("X-CSRFToken")
-        )
-        saved = session.get("_csrf_token")
-        if not saved or not submitted or not secrets.compare_digest(saved, submitted):
-            abort(400, description="Invalid CSRF token.")
+        token = request.form.get("_csrf_token") or request.headers.get("X-CSRF-Token")
+        if not token and request.is_json:
+            token = (request.get_json(silent=True) or {}).get("_csrf_token")
+        if token != session.get("_csrf_token"):
+            abort(400, "رمز الأمان غير صالح. أعد تحميل الصفحة وحاول مرة أخرى.")
 
 
-def current_user():
-    user_id = session.get("user_id")
-    if not user_id:
-        return None
-    if "current_user" not in g:
-        g.current_user = get_db().execute(
-            "SELECT id, username, role FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    return g.current_user
+@app.after_request
+def security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return resp
 
 
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if current_user() is None:
-            return redirect(url_for("login"))
-        return view(*args, **kwargs)
-
-    return wrapped
+def user():
+    return session.get("user")
 
 
-def admin_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        user = current_user()
-        if user is None:
-            return redirect(url_for("login"))
-        if user["role"] != "مدير":
+def login_required(fn):
+    @wraps(fn)
+    def inner(*a, **kw):
+        if not user():
+            return redirect(url_for("login", next=request.path))
+        return fn(*a, **kw)
+    return inner
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def inner(*a, **kw):
+        if not user():
+            return redirect(url_for("login", next=request.path))
+        if user()["role"] != "مدير":
             abort(403)
-        return view(*args, **kwargs)
-
-    return wrapped
-
-
-def clean_text(value, field_name, max_len=255, required=True):
-    value = (value or "").strip()
-    value = re.sub(r"\s+", " ", value)
-    if required and not value:
-        raise ValueError(f"{field_name} مطلوب.")
-    if len(value) > max_len:
-        raise ValueError(f"{field_name} طويل جداً.")
-    return value
+        return fn(*a, **kw)
+    return inner
 
 
-def clean_multiline(value, field_name, max_len=2000, required=False):
-    value = (value or "").strip()
-    if required and not value:
-        raise ValueError(f"{field_name} مطلوب.")
-    if len(value) > max_len:
-        raise ValueError(f"{field_name} طويل جداً.")
-    return value
+def clean(v, limit=255, required=True):
+    v = re.sub(r"\s+", " ", (v or "").strip())
+    if required and not v:
+        raise ValueError("يوجد حقل مطلوب فارغ.")
+    if len(v) > limit:
+        raise ValueError(f"النص أطول من {limit} حرف.")
+    return v
 
 
-def parse_int(value, field_name, minimum=0):
+def amount(v, label="المبلغ", minimum=0):
     try:
-        number = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{field_name} يجب أن يكون رقماً صحيحاً.")
-    if number < minimum:
-        raise ValueError(f"{field_name} يجب ألا يقل عن {minimum}.")
-    return number
+        n = float(str(v or "0").replace(",", "").strip())
+    except ValueError:
+        raise ValueError(f"{label} يجب أن يكون رقماً.")
+    if n < minimum:
+        raise ValueError(f"{label} لا يمكن أن يكون أقل من {minimum}.")
+    return round(n, 2)
 
 
-def parse_money(value, field_name, minimum=0):
+def qty(v, label="الكمية", minimum=0):
     try:
-        number = float(value or 0)
-    except (TypeError, ValueError):
-        raise ValueError(f"{field_name} يجب أن يكون رقماً.")
-    if number < minimum:
-        raise ValueError(f"{field_name} يجب ألا يقل عن {minimum}.")
-    return round(number, 2)
+        n = int(str(v or "0").replace(",", "").strip())
+    except ValueError:
+        raise ValueError(f"{label} يجب أن تكون رقماً صحيحاً.")
+    if n < minimum:
+        raise ValueError(f"{label} لا يمكن أن تكون أقل من {minimum}.")
+    return n
 
 
-def format_money(value):
+def q1(sql, p=()):
+    return get_db().execute(sql, p).fetchone()
+
+
+def qa(sql, p=()):
+    return get_db().execute(sql, p).fetchall()
+
+
+def today():
+    return date.today().isoformat()
+
+
+def money(v):
     try:
-        return f"${float(value or 0):,.2f}"
-    except (TypeError, ValueError):
-        return "$0.00"
+        v = float(v or 0)
+    except Exception:
+        v = 0
+    return f"{v:,.0f} {CURRENCY}" if v.is_integer() else f"{v:,.2f} {CURRENCY}"
 
 
-app.jinja_env.filters["money"] = format_money
+@app.template_filter("money")
+def money_filter(v):
+    return money(v)
 
 
-def scalar(sql, params=()):
-    row = get_db().execute(sql, params).fetchone()
-    if row is None:
-        return 0
-    value = row[0]
-    return value if value is not None else 0
+@app.template_filter("num")
+def num_filter(v):
+    try:
+        v = float(v or 0)
+    except Exception:
+        v = 0
+    return f"{v:,.0f}" if v.is_integer() else f"{v:,.2f}"
 
 
-def calculate_metrics():
-    gross_sales = scalar("SELECT COALESCE(SUM(grand_total), 0) FROM invoices")
-    product_profit = scalar("SELECT COALESCE(SUM((price - cost) * qty), 0) FROM invoice_items")
-    labor_profit = scalar("SELECT COALESCE(SUM(labor_cost), 0) FROM invoices")
-    invoice_direct_expenses = scalar("SELECT COALESCE(SUM(expenses_cost), 0) FROM invoices")
-    recorded_expenses = scalar("SELECT COALESCE(SUM(amount), 0) FROM expenses")
-    total_expenses = float(recorded_expenses or 0) + float(invoice_direct_expenses or 0)
-    net_profit = float(product_profit or 0) + float(labor_profit or 0) - total_expenses
-    inventory_pieces = scalar("SELECT COALESCE(SUM(qty), 0) FROM inventory")
-    active_projects = scalar("SELECT COUNT(*) FROM customers WHERE status = ?", ("قيد التنفيذ",))
-    return {
-        "gross_sales": round(float(gross_sales or 0), 2),
-        "product_profit": round(float(product_profit or 0), 2),
-        "labor_profit": round(float(labor_profit or 0), 2),
-        "total_expenses": round(float(total_expenses or 0), 2),
-        "net_profit": round(float(net_profit or 0), 2),
-        "inventory_pieces": int(inventory_pieces or 0),
-        "active_projects": int(active_projects or 0),
-    }
+def backup_db():
+    if DB_PATH.exists():
+        dst = BACKUP_DIR / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3"
+        shutil.copy2(DB_PATH, dst)
+        return dst
+    return None
 
 
-def safe_filename(value):
-    value = re.sub(r"[^\w\u0600-\u06FF.-]+", "_", str(value), flags=re.UNICODE).strip("_")
-    return value or "file"
+def metrics():
+    r = q1("""
+    SELECT
+    COALESCE((SELECT SUM(grand_total) FROM invoices),0) gross_sales,
+    COALESCE((SELECT SUM(qty) FROM inventory),0) inventory_pieces,
+    COALESCE((SELECT COUNT(*) FROM customers WHERE status='قيد التنفيذ'),0) active_projects,
+    COALESCE((SELECT SUM(amount) FROM expenses),0) total_expenses,
+    COALESCE((SELECT SUM((price-cost)*qty) FROM invoice_items),0) product_profit,
+    COALESCE((SELECT SUM(labor_cost) FROM invoices),0) labor_profit
+    """)
+    d = dict(r)
+    d["net_profit"] = (
+        float(d["product_profit"] or 0)
+        + float(d["labor_profit"] or 0)
+        - float(d["total_expenses"] or 0)
+    )
+    return d
 
 
-BASE_HTML = """
+BASE = """
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="csrf-token" content="{{ csrf_token() }}">
-    <title>{{ title }} · {{ app_name }}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    fontFamily: { cairo: ['Cairo', 'sans-serif'] },
-                    boxShadow: {
-                        glow: '0 0 35px rgba(14, 165, 233, .18)',
-                        soft: '0 18px 60px rgba(0,0,0,.35)'
-                    }
-                }
-            }
-        }
-    </script>
-    <style>
-        body { font-family: 'Cairo', sans-serif; }
-        .glass { background: rgba(15, 23, 42, .72); border: 1px solid rgba(148, 163, 184, .16); backdrop-filter: blur(18px); }
-        .input { width: 100%; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, .2); background: rgba(15, 23, 42, .92); padding: .8rem 1rem; color: #e5e7eb; outline: none; transition: .2s; }
-        .input:focus { border-color: rgba(56, 189, 248, .75); box-shadow: 0 0 0 4px rgba(14, 165, 233, .12); }
-        .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; border-radius: 1rem; padding: .75rem 1rem; font-weight: 800; transition: .2s; white-space: nowrap; }
-        .btn-primary { background: linear-gradient(135deg, #0284c7, #0891b2, #14b8a6); color: white; box-shadow: 0 12px 30px rgba(8,145,178,.24); }
-        .btn-primary:hover { transform: translateY(-1px); filter: brightness(1.08); }
-        .btn-muted { background: rgba(30, 41, 59, .92); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, .16); }
-        .btn-muted:hover { background: rgba(51, 65, 85, .95); }
-        .btn-danger { background: rgba(220, 38, 38, .16); color: #fecaca; border: 1px solid rgba(248, 113, 113, .25); }
-        .btn-danger:hover { background: rgba(220, 38, 38, .28); }
-        .table-head { color: #93c5fd; font-size: .78rem; letter-spacing: .03em; }
-        .scrollbar-thin::-webkit-scrollbar { height: 8px; width: 8px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(148,163,184,.35); border-radius: 999px; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} - {{ app_name }}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<script>
+tailwind.config={theme:{extend:{fontFamily:{sans:['Cairo','Tajawal','system-ui','sans-serif']},colors:{gold:'#f5c451',ink:'#070a12'},boxShadow:{premium:'0 24px 75px rgba(0,0,0,.38)'}}}}
+</script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap');
+*{font-family:Cairo,system-ui,sans-serif}
+body{background:radial-gradient(circle at 85% 0,rgba(245,196,81,.17),transparent 35%),#070a12}
+.glass{background:rgba(15,23,42,.74);border:1px solid rgba(148,163,184,.17);backdrop-filter:blur(18px)}
+.soft{background:rgba(2,6,23,.74);border:1px solid rgba(148,163,184,.25);color:#e5e7eb}
+.soft:focus{outline:0;border-color:#f5c451;box-shadow:0 0 0 3px rgba(245,196,81,.13)}
+.gold{background:linear-gradient(135deg,#f5c451,#d69e2e);color:#111827;font-weight:900}
+.link.active,.link:hover{background:rgba(245,196,81,.14);color:#fff;border-color:rgba(245,196,81,.35)}
+.tr:hover{background:rgba(245,196,81,.055)}
+</style>
 </head>
-<body class="min-h-screen bg-slate-950 text-slate-100">
-    <div class="fixed inset-0 -z-10">
-        <div class="absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(6,182,212,.18),transparent_35%),radial-gradient(circle_at_bottom_right,rgba(59,130,246,.14),transparent_35%)]"></div>
-        <div class="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(15,23,42,.35),rgba(2,6,23,1))]"></div>
-    </div>
+<body class="min-h-screen text-slate-100">
+<div class="flex min-h-screen">
+<aside class="fixed right-0 top-0 hidden h-screen w-80 flex-col border-l border-white/10 bg-slate-950/95 p-5 lg:flex">
+<div class="mb-7 flex gap-3">
+<div class="grid h-12 w-12 place-items-center rounded-2xl bg-gold text-slate-950"><i class="fa-solid fa-solar-panel"></i></div>
+<div><h1 class="font-black">{{ app_name }}</h1><p class="text-xs text-slate-400">واجهة One Million عربية</p></div>
+</div>
+<nav class="space-y-2">
+{% set L=[('dashboard','لوحة التحكم','fa-chart-line'),('inventory','المستودع والمخزن','fa-warehouse'),('invoices','المبيعات والفواتير','fa-file-invoice-dollar'),('expenses','المصروفات','fa-receipt'),('customers','العملاء والمشاريع','fa-users-gear')] %}
+{% for ep,la,ic in L %}
+<a class="link {{'active' if active==ep else ''}} flex items-center gap-3 rounded-2xl border border-transparent px-4 py-3 text-sm font-bold text-slate-300" href="{{ url_for(ep) }}">
+<i class="fa-solid {{ic}} w-5 text-gold"></i>{{la}}</a>
+{% endfor %}
+{% if u.role=='مدير' %}
+<a class="link {{'active' if active=='users' else ''}} flex items-center gap-3 rounded-2xl border border-transparent px-4 py-3 text-sm font-bold text-slate-300" href="{{ url_for('users') }}">
+<i class="fa-solid fa-user-shield w-5 text-gold"></i>إدارة المستخدمين</a>
+{% endif %}
+</nav>
+<div class="mt-auto rounded-3xl bg-white/[.04] p-4">
+<b>{{u.username}}</b><p class="text-xs text-slate-400">{{u.role}}</p>
+<a class="mt-3 block rounded-2xl bg-red-500/10 p-3 text-center font-bold text-red-200" href="{{ url_for('logout') }}">تسجيل الخروج</a>
+</div>
+</aside>
 
-    <button onclick="toggleSidebar()" class="lg:hidden fixed top-4 right-4 z-50 btn btn-primary px-3 py-2">
-        <i class="fa-solid fa-bars"></i>
-    </button>
+<main class="w-full lg:mr-80">
+<header class="sticky top-0 z-30 border-b border-white/10 bg-slate-950/80 p-4 backdrop-blur-xl">
+<div class="flex items-center justify-between">
+<div><h2 class="text-2xl font-black">{{ title }}</h2><p class="text-xs text-slate-400">{{ now }} · العملة: {{ currency }}</p></div>
+<button onclick="m.classList.toggle('hidden')" class="rounded-2xl bg-white/10 p-3 lg:hidden"><i class="fa-solid fa-bars"></i></button>
+</div>
+</header>
 
-    <aside id="sidebar" class="fixed top-0 right-0 z-40 h-screen w-80 translate-x-full lg:translate-x-0 transition-transform duration-300 glass shadow-soft">
-        <div class="flex h-full flex-col">
-            <div class="p-6 border-b border-slate-700/50">
-                <div class="flex items-center gap-3">
-                    <div class="h-12 w-12 rounded-2xl bg-gradient-to-br from-sky-500 to-teal-400 flex items-center justify-center shadow-glow">
-                        <i class="fa-solid fa-solar-panel text-white text-xl"></i>
-                    </div>
-                    <div>
-                        <div class="text-xl font-black">{{ app_name }}</div>
-                        <div class="text-xs text-slate-400">نظام إدارة الطاقة الشمسية</div>
-                    </div>
-                </div>
-            </div>
+<div id="m" class="fixed inset-0 z-50 hidden bg-black/80 p-4 lg:hidden">
+<div class="glass h-full rounded-3xl p-4">
+<button onclick="m.classList.add('hidden')" class="mb-4 rounded-xl bg-white/10 px-4 py-2">إغلاق</button>
+<a class="block p-3" href="{{url_for('dashboard')}}">لوحة التحكم</a>
+<a class="block p-3" href="{{url_for('inventory')}}">المستودع</a>
+<a class="block p-3" href="{{url_for('invoices')}}">الفواتير</a>
+<a class="block p-3" href="{{url_for('expenses')}}">المصروفات</a>
+<a class="block p-3" href="{{url_for('customers')}}">العملاء</a>
+{% if u.role=='مدير' %}<a class="block p-3" href="{{url_for('users')}}">المستخدمون</a>{% endif %}
+</div>
+</div>
 
-            <nav class="flex-1 p-4 space-y-2 overflow-y-auto scrollbar-thin">
-                <a href="{{ url_for('dashboard') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'dashboard' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-chart-line w-5"></i><span>لوحة التحكم</span>
-                </a>
-                <a href="{{ url_for('inventory') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'inventory' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-warehouse w-5"></i><span>المستودع والمخزن</span>
-                </a>
-                <a href="{{ url_for('sales') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'sales' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-file-invoice-dollar w-5"></i><span>المبيعات والفواتير</span>
-                </a>
-                <a href="{{ url_for('expenses') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'expenses' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-wallet w-5"></i><span>المصروفات</span>
-                </a>
-                <a href="{{ url_for('customers') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'customers' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-users-viewfinder w-5"></i><span>العملاء والمشاريع</span>
-                </a>
-                {% if user and user.role == 'مدير' %}
-                <a href="{{ url_for('users') }}" class="flex items-center gap-3 rounded-2xl px-4 py-3 font-bold transition {{ 'bg-sky-500/15 text-sky-200 border border-sky-400/20' if active == 'users' else 'text-slate-300 hover:bg-slate-800/70' }}">
-                    <i class="fa-solid fa-user-shield w-5"></i><span>إدارة المستخدمين</span>
-                </a>
-                {% endif %}
-            </nav>
-
-            <div class="p-4 border-t border-slate-700/50">
-                <div class="rounded-2xl bg-slate-900/70 p-4 border border-slate-700/60 mb-3">
-                    <div class="text-sm text-slate-400">المستخدم الحالي</div>
-                    <div class="font-black">{{ user.username if user else '' }}</div>
-                    <div class="text-xs text-teal-300">{{ user.role if user else '' }}</div>
-                </div>
-                <a href="{{ url_for('logout') }}" class="btn btn-muted w-full">
-                    <i class="fa-solid fa-right-from-bracket"></i> تسجيل الخروج
-                </a>
-            </div>
-        </div>
-    </aside>
-
-    <main class="lg:mr-80 min-h-screen">
-        <header class="sticky top-0 z-30 bg-slate-950/72 backdrop-blur-xl border-b border-slate-800/90">
-            <div class="px-5 md:px-8 py-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-                <div>
-                    <h1 class="text-2xl md:text-3xl font-black">{{ title }}</h1>
-                    <p class="text-sm text-slate-400">إدارة احترافية للمخزون، المبيعات، المصروفات، والمشاريع.</p>
-                </div>
-                <div class="text-xs text-slate-400 flex items-center gap-2">
-                    <i class="fa-regular fa-clock"></i>
-                    <span>{{ now }}</span>
-                </div>
-            </div>
-        </header>
-
-        <section class="p-5 md:p-8">
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    <div class="space-y-3 mb-6">
-                        {% for category, message in messages %}
-                            <div class="rounded-2xl px-4 py-3 border {{ 'bg-emerald-500/10 border-emerald-400/20 text-emerald-100' if category == 'success' else 'bg-rose-500/10 border-rose-400/20 text-rose-100' }}">
-                                <i class="fa-solid {{ 'fa-circle-check' if category == 'success' else 'fa-triangle-exclamation' }} ml-2"></i>{{ message }}
-                            </div>
-                        {% endfor %}
-                    </div>
-                {% endif %}
-            {% endwith %}
-            {{ content|safe }}
-        </section>
-    </main>
-
-    <script>
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('translate-x-full');
-        }
-        function confirmDelete(message) {
-            return confirm(message || 'هل أنت متأكد من الحذف؟');
-        }
-    </script>
-    {{ extra_js|safe }}
+<section class="p-4 sm:p-6 lg:p-8">
+{% with ms=get_flashed_messages(with_categories=true) %}
+{% for c,msg in ms %}
+<div class="mb-3 rounded-2xl border px-4 py-3 font-bold {{'border-emerald-400/30 bg-emerald-400/10 text-emerald-100' if c=='success' else 'border-red-400/30 bg-red-400/10 text-red-100'}}">{{msg}}</div>
+{% endfor %}
+{% endwith %}
+{{ content|safe }}
+</section>
+</main>
+</div>
+<script>
+function delmsg(t){return confirm(t||'هل أنت متأكد؟')}
+function nf(n){return new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n||0))}
+</script>
 </body>
 </html>
 """
 
 
-def render_page(title, active, content_template, extra_js="", **context):
-    content = render_template_string(content_template, **context)
+def page(title, body, active, **ctx):
     return render_template_string(
-        BASE_HTML,
+        BASE,
         title=title,
-        active=active,
-        content=content,
-        extra_js=extra_js,
-        user=current_user(),
         app_name=APP_NAME,
+        active=active,
+        content=Markup(render_template_string(body, **ctx)),
+        u=user(),
         now=datetime.now().strftime("%Y-%m-%d %H:%M"),
+        currency=CURRENCY,
     )
 
 
-LOGIN_HTML = """
+LOGIN = """
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>تسجيل الدخول · {{ app_name }}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
-    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Cairo', sans-serif; }
-        .glass { background: rgba(15, 23, 42, .74); border: 1px solid rgba(148, 163, 184, .18); backdrop-filter: blur(22px); }
-        .input { width: 100%; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, .22); background: rgba(15, 23, 42, .94); padding: .9rem 1rem; color: #e5e7eb; outline: none; }
-        .input:focus { border-color: rgba(56, 189, 248, .8); box-shadow: 0 0 0 4px rgba(14, 165, 233, .12); }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>دخول</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+*{font-family:Cairo}
+body{background:radial-gradient(circle at 20% 0,rgba(245,196,81,.22),transparent 35%),#050814}
+.soft{background:#020617;border:1px solid #334155;color:white}
+</style>
 </head>
-<body class="min-h-screen bg-slate-950 text-slate-100 overflow-hidden">
-    <div class="absolute inset-0 bg-[radial-gradient(circle_at_20%_10%,rgba(14,165,233,.28),transparent_35%),radial-gradient(circle_at_90%_90%,rgba(20,184,166,.22),transparent_35%)]"></div>
-    <div class="relative min-h-screen grid lg:grid-cols-2">
-        <section class="hidden lg:flex flex-col justify-center p-16">
-            <div class="max-w-xl">
-                <div class="h-16 w-16 rounded-3xl bg-gradient-to-br from-sky-500 to-teal-400 flex items-center justify-center shadow-2xl mb-8">
-                    <i class="fa-solid fa-solar-panel text-3xl text-white"></i>
-                </div>
-                <h1 class="text-5xl font-black leading-tight mb-5">SolarPro ERP</h1>
-                <p class="text-xl text-slate-300 leading-9">
-                    منصة تشغيلية متكاملة لإدارة شركات الطاقة الشمسية: مخزون، فواتير، أرباح، مصروفات، ومتابعة مشاريع.
-                </p>
-                <div class="mt-10 grid grid-cols-3 gap-4">
-                    <div class="glass rounded-3xl p-5"><i class="fa-solid fa-shield-halved text-sky-300 mb-3"></i><div class="font-black">آمن</div></div>
-                    <div class="glass rounded-3xl p-5"><i class="fa-solid fa-cloud text-teal-300 mb-3"></i><div class="font-black">جاهز للسحابة</div></div>
-                    <div class="glass rounded-3xl p-5"><i class="fa-solid fa-bolt text-amber-300 mb-3"></i><div class="font-black">سريع</div></div>
-                </div>
-            </div>
-        </section>
-
-        <section class="flex items-center justify-center p-6">
-            <form method="post" class="glass rounded-[2rem] shadow-2xl p-8 w-full max-w-md">
-                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                <div class="text-center mb-8">
-                    <div class="mx-auto h-16 w-16 rounded-3xl bg-gradient-to-br from-sky-500 to-teal-400 flex items-center justify-center shadow-2xl mb-4">
-                        <i class="fa-solid fa-lock text-2xl text-white"></i>
-                    </div>
-                    <h2 class="text-3xl font-black">تسجيل الدخول</h2>
-                    <p class="text-slate-400 mt-2">أدخل بيانات الوصول للنظام</p>
-                </div>
-
-                {% with messages = get_flashed_messages(with_categories=true) %}
-                    {% if messages %}
-                        {% for category, message in messages %}
-                            <div class="rounded-2xl bg-rose-500/10 border border-rose-400/20 text-rose-100 px-4 py-3 mb-4">
-                                <i class="fa-solid fa-triangle-exclamation ml-2"></i>{{ message }}
-                            </div>
-                        {% endfor %}
-                    {% endif %}
-                {% endwith %}
-
-                <label class="block mb-4">
-                    <span class="text-sm text-slate-300 font-bold">اسم المستخدم</span>
-                    <input class="input mt-2" name="username" autocomplete="username" required autofocus>
-                </label>
-
-                <label class="block mb-6">
-                    <span class="text-sm text-slate-300 font-bold">كلمة المرور</span>
-                    <input class="input mt-2" name="password" type="password" autocomplete="current-password" required>
-                </label>
-
-                <button class="w-full rounded-2xl bg-gradient-to-br from-sky-500 to-teal-400 py-4 font-black text-white shadow-2xl hover:brightness-110 transition">
-                    <i class="fa-solid fa-arrow-right-to-bracket ml-2"></i> دخول
-                </button>
-
-                <div class="mt-6 rounded-2xl bg-slate-900/75 border border-slate-700/60 p-4 text-sm text-slate-400">
-                    بيانات المدير الافتراضية:
-                    <span class="text-slate-100 font-bold">amgad</span> /
-                    <span class="text-slate-100 font-bold">123456</span>
-                </div>
-            </form>
-        </section>
-    </div>
+<body class="grid min-h-screen place-items-center p-4 text-white">
+<form method="post" class="w-full max-w-md rounded-[2rem] border border-white/10 bg-slate-950/75 p-8 shadow-2xl backdrop-blur-xl">
+<input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+<div class="mb-8 text-center">
+<div class="mx-auto mb-4 grid h-16 w-16 place-items-center rounded-3xl bg-yellow-400 text-slate-950"><i class="fa-solid fa-solar-panel text-2xl"></i></div>
+<h1 class="text-2xl font-black">{{app_name}}</h1>
+<p class="text-sm text-slate-400">تسجيل دخول آمن</p>
+</div>
+{% with ms=get_flashed_messages(with_categories=true) %}
+{% for c,m in ms %}<p class="mb-3 rounded-2xl bg-red-500/10 p-3 text-red-100">{{m}}</p>{% endfor %}
+{% endwith %}
+<input name="username" class="soft mb-3 w-full rounded-2xl px-4 py-3" placeholder="اسم المستخدم" required>
+<input name="password" type="password" class="soft mb-4 w-full rounded-2xl px-4 py-3" placeholder="كلمة المرور" required>
+<button class="w-full rounded-2xl bg-yellow-400 py-3 font-black text-slate-950">دخول النظام</button>
+<p class="mt-5 text-center text-xs text-slate-400">amgad / 123456 · مدير</p>
+</form>
 </body>
 </html>
 """
-
-
-@app.route("/healthz")
-def healthz():
-    return jsonify({"status": "ok", "database": str(DB_PATH)})
-
-
-@app.route("/")
-def index():
-    if current_user():
-        return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if current_user():
+    if user():
         return redirect(url_for("dashboard"))
-
     if request.method == "POST":
-        username = clean_text(request.form.get("username"), "اسم المستخدم", max_len=80, required=True)
-        password = request.form.get("password") or ""
-        user = get_db().execute(
-            "SELECT id, username, password, role FROM users WHERE username = ?",
-            (username,),
-        ).fetchone()
-
-        if user and check_password_hash(user["password"], password):
-            session.clear()
-            session["user_id"] = user["id"]
-            csrf_token()
-            flash("تم تسجيل الدخول بنجاح.", "success")
-            return redirect(url_for("dashboard"))
-
-        flash("بيانات الدخول غير صحيحة.", "error")
-
-    return render_template_string(LOGIN_HTML, app_name=APP_NAME)
+        username = clean(request.form.get("username"), 80)
+        password = request.form.get("password", "")
+        r = q1("SELECT * FROM users WHERE username=?", (username,))
+        if not r or not check_password_hash(r["password"], password):
+            flash("بيانات الدخول غير صحيحة.", "error")
+            return redirect(url_for("login"))
+        session.clear()
+        session.permanent = True
+        session["user"] = {"id": r["id"], "username": r["username"], "role": r["role"]}
+        csrf_token()
+        return redirect(request.args.get("next") or url_for("dashboard"))
+    return render_template_string(LOGIN, app_name=APP_NAME)
 
 
 @app.route("/logout")
@@ -613,1627 +462,747 @@ def logout():
     return redirect(url_for("login"))
 
 
-@app.route("/dashboard")
+@app.route("/")
 @login_required
 def dashboard():
-    metrics = calculate_metrics()
-    recent_invoices = get_db().execute(
-        "SELECT id, customer_name, customer_phone, date, grand_total FROM invoices ORDER BY id DESC LIMIT 8"
-    ).fetchall()
-    low_stock = get_db().execute(
-        "SELECT id, name, category, qty, price FROM inventory WHERE qty <= 5 ORDER BY qty ASC, name ASC LIMIT 8"
-    ).fetchall()
-
-    template = """
-    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-5 mb-8">
-        <div class="glass rounded-3xl p-5 shadow-soft">
-            <div class="flex items-center justify-between mb-4">
-                <div class="text-slate-400 text-sm">Gross Sales</div>
-                <div class="h-11 w-11 rounded-2xl bg-sky-500/15 flex items-center justify-center text-sky-300"><i class="fa-solid fa-sack-dollar"></i></div>
-            </div>
-            <div class="text-3xl font-black">{{ metrics.gross_sales|money }}</div>
-            <div class="text-xs text-slate-500 mt-2">إجمالي قيمة الفواتير</div>
-        </div>
-        <div class="glass rounded-3xl p-5 shadow-soft">
-            <div class="flex items-center justify-between mb-4">
-                <div class="text-slate-400 text-sm">Net Profits</div>
-                <div class="h-11 w-11 rounded-2xl bg-emerald-500/15 flex items-center justify-center text-emerald-300"><i class="fa-solid fa-chart-simple"></i></div>
-            </div>
-            <div class="text-3xl font-black">{{ metrics.net_profit|money }}</div>
-            <div class="text-xs text-slate-500 mt-2">هامش المنتجات + الأجور - المصروفات</div>
-        </div>
-        <div class="glass rounded-3xl p-5 shadow-soft">
-            <div class="flex items-center justify-between mb-4">
-                <div class="text-slate-400 text-sm">Inventory Pieces</div>
-                <div class="h-11 w-11 rounded-2xl bg-indigo-500/15 flex items-center justify-center text-indigo-300"><i class="fa-solid fa-boxes-stacked"></i></div>
-            </div>
-            <div class="text-3xl font-black">{{ metrics.inventory_pieces }}</div>
-            <div class="text-xs text-slate-500 mt-2">إجمالي القطع المتبقية</div>
-        </div>
-        <div class="glass rounded-3xl p-5 shadow-soft">
-            <div class="flex items-center justify-between mb-4">
-                <div class="text-slate-400 text-sm">Active Projects</div>
-                <div class="h-11 w-11 rounded-2xl bg-amber-500/15 flex items-center justify-center text-amber-300"><i class="fa-solid fa-person-digging"></i></div>
-            </div>
-            <div class="text-3xl font-black">{{ metrics.active_projects }}</div>
-            <div class="text-xs text-slate-500 mt-2">مشاريع قيد التنفيذ</div>
-        </div>
-        <div class="glass rounded-3xl p-5 shadow-soft">
-            <div class="flex items-center justify-between mb-4">
-                <div class="text-slate-400 text-sm">Total Expenses</div>
-                <div class="h-11 w-11 rounded-2xl bg-rose-500/15 flex items-center justify-center text-rose-300"><i class="fa-solid fa-receipt"></i></div>
-            </div>
-            <div class="text-3xl font-black">{{ metrics.total_expenses|money }}</div>
-            <div class="text-xs text-slate-500 mt-2">المصروفات المسجلة والمباشرة</div>
-        </div>
+    m = metrics()
+    low = qa("SELECT name,qty FROM inventory WHERE qty<=5 ORDER BY qty,name LIMIT 7")
+    recent = qa("SELECT * FROM invoices ORDER BY id DESC LIMIT 5")
+    cards = [
+        ("إجمالي المبيعات", money(m["gross_sales"]), "fa-sack-dollar", "from-emerald-400/20"),
+        ("صافي الأرباح", money(m["net_profit"]), "fa-chart-simple", "from-yellow-400/20"),
+        ("قطع المخزون", f"{m['inventory_pieces']:,.0f}", "fa-boxes-stacked", "from-sky-400/20"),
+        ("المشاريع النشطة", f"{m['active_projects']:,.0f}", "fa-person-digging", "from-purple-400/20"),
+        ("إجمالي المصروفات", money(m["total_expenses"]), "fa-money-bill-wave", "from-red-400/20"),
+    ]
+    body = """
+    <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+    {% for label,val,icon,tint in cards %}
+    <div class="glass rounded-3xl bg-gradient-to-br {{tint}} to-transparent p-5 shadow-premium">
+    <div class="flex items-center justify-between"><div><p class="text-sm font-bold text-slate-400">{{label}}</p><p class="mt-2 text-2xl font-black">{{val}}</p></div><i class="fa-solid {{icon}} text-2xl text-gold"></i></div>
+    </div>
+    {% endfor %}
     </div>
 
-    <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <div class="flex items-center justify-between mb-5">
-                <div>
-                    <h2 class="text-xl font-black">آخر الفواتير</h2>
-                    <p class="text-sm text-slate-400">أحدث عمليات البيع المسجلة</p>
-                </div>
-                <a href="{{ url_for('sales') }}" class="btn btn-muted text-sm"><i class="fa-solid fa-plus"></i> فاتورة جديدة</a>
-            </div>
-            <div class="overflow-x-auto scrollbar-thin">
-                <table class="w-full text-sm">
-                    <thead>
-                        <tr class="table-head border-b border-slate-700/70">
-                            <th class="py-3 text-right">#</th>
-                            <th class="py-3 text-right">العميل</th>
-                            <th class="py-3 text-right">الهاتف</th>
-                            <th class="py-3 text-right">التاريخ</th>
-                            <th class="py-3 text-right">الإجمالي</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for inv in recent_invoices %}
-                        <tr class="border-b border-slate-800/70 hover:bg-slate-800/35">
-                            <td class="py-3 font-bold">{{ inv.id }}</td>
-                            <td class="py-3">{{ inv.customer_name }}</td>
-                            <td class="py-3 text-slate-400">{{ inv.customer_phone }}</td>
-                            <td class="py-3 text-slate-400">{{ inv.date }}</td>
-                            <td class="py-3 font-black text-emerald-300">{{ inv.grand_total|money }}</td>
-                        </tr>
-                        {% else %}
-                        <tr><td colspan="5" class="py-8 text-center text-slate-500">لا توجد فواتير بعد.</td></tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
+    <div class="mt-6 grid gap-6 xl:grid-cols-3">
+    <section class="glass rounded-3xl p-5 xl:col-span-2">
+    <div class="mb-3 flex justify-between"><h3 class="text-lg font-black"><i class="fa-solid fa-brain ml-2 text-gold"></i>المساعد المالي الذكي</h3><span class="rounded-full bg-gold/10 px-3 py-1 text-xs text-gold">AJAX</span></div>
+    <div id="chat" class="mb-3 h-72 overflow-y-auto rounded-3xl bg-slate-950/70 p-4">
+    <div class="mb-2 max-w-[85%] rounded-3xl rounded-tr-none bg-white/10 p-3 text-sm">اسأل: ما صافي الأرباح؟ كم مخزون البطاريات؟ إجمالي المصروفات؟ أفضل المنتجات مبيعاً؟</div>
+    </div>
+    <form id="f" class="flex gap-2"><input id="csrf" type="hidden" value="{{csrf_token()}}"><input id="q" class="soft flex-1 rounded-2xl px-4 py-3" placeholder="اكتب السؤال..."><button class="gold rounded-2xl px-5"><i class="fa-solid fa-paper-plane"></i></button></form>
+    </section>
 
-        <div class="glass rounded-3xl p-6 shadow-soft">
-            <h2 class="text-xl font-black mb-1">AI Financial Assistant</h2>
-            <p class="text-sm text-slate-400 mb-4">اسأل عن الأرباح، المخزون، المصروفات، أو المشاريع.</p>
-            <div id="aiBox" class="h-72 overflow-y-auto scrollbar-thin rounded-3xl bg-slate-950/60 border border-slate-800 p-4 space-y-3 mb-4">
-                <div class="max-w-[85%] rounded-2xl bg-sky-500/15 border border-sky-400/20 p-3 text-sm">
-                    مرحباً، اسألني مثلاً: ما صافي الربح؟ أو كم مخزون الألواح؟
-                </div>
-            </div>
-            <div class="flex gap-2">
-                <input id="aiInput" class="input" placeholder="اكتب سؤالك هنا...">
-                <button onclick="askAI()" class="btn btn-primary px-4"><i class="fa-solid fa-paper-plane"></i></button>
-            </div>
-        </div>
+    <aside class="space-y-6">
+    <section class="glass rounded-3xl p-5"><h3 class="mb-3 font-black">تنبيهات المخزون</h3>
+    {% for x in low %}<div class="mb-2 flex justify-between rounded-2xl bg-white/5 p-3"><b>{{x.name}}</b><span class="text-red-200">{{x.qty}}</span></div>
+    {% else %}<p class="text-emerald-200">المخزون مستقر.</p>{% endfor %}
+    </section>
+    <section class="glass rounded-3xl p-5"><h3 class="mb-3 font-black">آخر الفواتير</h3>
+    {% for i in recent %}<a class="mb-2 block rounded-2xl bg-white/5 p-3" href="{{url_for('invoice_detail',invoice_id=i.id)}}"><b>#{{i.id}} {{i.customer_name}}</b><p class="text-xs text-slate-400">{{i.grand_total|money}}</p></a>
+    {% else %}<p class="text-slate-400">لا توجد فواتير.</p>{% endfor %}
+    </section>
+    </aside>
     </div>
 
-    <div class="glass rounded-3xl p-6 shadow-soft mt-6">
-        <div class="flex items-center justify-between mb-5">
-            <div>
-                <h2 class="text-xl font-black">تنبيهات المخزون المنخفض</h2>
-                <p class="text-sm text-slate-400">المنتجات التي وصلت إلى 5 قطع أو أقل</p>
-            </div>
-        </div>
-        <div class="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
-            {% for item in low_stock %}
-            <div class="rounded-3xl border border-amber-400/15 bg-amber-500/10 p-4">
-                <div class="font-black">{{ item.name }}</div>
-                <div class="text-sm text-slate-400">{{ item.category }}</div>
-                <div class="mt-3 flex items-center justify-between">
-                    <span class="text-xs text-slate-400">المتبقي</span>
-                    <span class="text-2xl font-black text-amber-200">{{ item.qty }}</span>
-                </div>
-            </div>
-            {% else %}
-            <div class="col-span-full text-center text-slate-500 py-6">لا توجد تنبيهات مخزون منخفض حالياً.</div>
-            {% endfor %}
-        </div>
-    </div>
-    """
-
-    extra_js = """
     <script>
-        const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
-
-        function appendAiMessage(text, fromUser=false) {
-            const box = document.getElementById('aiBox');
-            const div = document.createElement('div');
-            div.className = fromUser
-                ? 'mr-auto max-w-[85%] rounded-2xl bg-teal-500/15 border border-teal-400/20 p-3 text-sm'
-                : 'max-w-[85%] rounded-2xl bg-sky-500/15 border border-sky-400/20 p-3 text-sm';
-            div.textContent = text;
-            box.appendChild(div);
-            box.scrollTop = box.scrollHeight;
-        }
-
-        async function askAI() {
-            const input = document.getElementById('aiInput');
-            const message = input.value.trim();
-            if (!message) return;
-            appendAiMessage(message, true);
-            input.value = '';
-            try {
-                const res = await fetch('/api/ai-assistant', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken},
-                    body: JSON.stringify({message})
-                });
-                const data = await res.json();
-                appendAiMessage(data.answer || 'لم أستطع معالجة السؤال.');
-            } catch (error) {
-                appendAiMessage('حدث خطأ في الاتصال بالمساعد.');
-            }
-        }
-
-        document.getElementById('aiInput').addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') askAI();
-        });
+    function b(t,m=false){let d=document.createElement('div');d.className='mb-2 max-w-[85%] rounded-3xl p-3 text-sm '+(m?'mr-auto rounded-tl-none bg-gold text-slate-950 font-bold':'rounded-tr-none bg-white/10');d.textContent=t;chat.appendChild(d);chat.scrollTop=chat.scrollHeight}
+    f.onsubmit=async e=>{e.preventDefault();let s=q.value.trim();if(!s)return;b(s,true);q.value='';let r=await fetch('{{url_for('api_assistant')}}',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf.value},body:JSON.stringify({question:s})});let j=await r.json();b(j.answer||'لا توجد إجابة.')}
     </script>
     """
-    return render_page("لوحة التحكم", "dashboard", template, extra_js=extra_js, metrics=metrics, recent_invoices=recent_invoices, low_stock=low_stock)
+    return page("لوحة التحكم", body, "dashboard", cards=cards, low=low, recent=recent)
 
 
-@app.route("/api/ai-assistant", methods=["POST"])
+@app.route("/api/assistant", methods=["POST"])
 @login_required
-def ai_assistant():
-    data = request.get_json(silent=True) or {}
-    message = clean_text(data.get("message"), "السؤال", max_len=500, required=True)
-    msg = message.lower()
-    metrics = calculate_metrics()
+def api_assistant():
+    question = clean((request.get_json(silent=True) or {}).get("question"), 500).lower()
+    m = metrics()
 
-    inventory_rows = get_db().execute(
-        "SELECT name, category, qty, cost, price FROM inventory ORDER BY name ASC"
-    ).fetchall()
+    if any(w in question for w in ["ربح", "أرباح", "صافي", "profit"]):
+        return jsonify(answer=f"صافي الأرباح: {money(m['net_profit'])}. المعادلة: ربح المنتجات {money(m['product_profit'])} + أجور التركيب {money(m['labor_profit'])} - المصروفات {money(m['total_expenses'])}.")
 
-    if any(word in msg for word in ["ربح", "profit", "net", "صافي"]):
-        answer = (
-            f"صافي الربح الحالي هو {format_money(metrics['net_profit'])}. "
-            f"الحساب: ربح المنتجات {format_money(metrics['product_profit'])} "
-            f"+ أجور التركيب {format_money(metrics['labor_profit'])} "
-            f"- المصروفات {format_money(metrics['total_expenses'])}."
-        )
-        return jsonify({"answer": answer})
+    if any(w in question for w in ["مبيعات", "ايراد", "إيراد", "sales"]):
+        return jsonify(answer=f"إجمالي المبيعات هو {money(m['gross_sales'])}.")
 
-    if any(word in msg for word in ["مبيعات", "sales", "gross", "إجمالي"]):
-        return jsonify({"answer": f"إجمالي المبيعات المسجلة حتى الآن هو {format_money(metrics['gross_sales'])}."})
+    if any(w in question for w in ["مصروف", "مصروفات", "expenses"]):
+        cats = qa("SELECT category,SUM(amount) total FROM expenses GROUP BY category ORDER BY total DESC LIMIT 5")
+        details = "، ".join(f"{c['category']}: {money(c['total'])}" for c in cats) or "لا توجد تفاصيل بعد."
+        return jsonify(answer=f"إجمالي المصروفات {money(m['total_expenses'])}. {details}")
 
-    if any(word in msg for word in ["مصروف", "expenses", "expense", "تكاليف"]):
-        return jsonify({"answer": f"إجمالي المصروفات الحالية هو {format_money(metrics['total_expenses'])}."})
+    if any(w in question for w in ["مخزون", "متوفر", "كمية", "stock"]):
+        rows = qa("SELECT name,qty FROM inventory ORDER BY name")
+        words = [w for w in re.split(r"\s+", question) if len(w) >= 3]
+        hits = [r for r in rows if r["name"].lower() in question or any(w in r["name"].lower() for w in words)]
+        hits = hits[:5] if hits else qa("SELECT name,qty FROM inventory ORDER BY qty ASC,name LIMIT 5")
+        return jsonify(answer="، ".join(f"{r['name']}: {r['qty']} قطعة" for r in hits) if hits else "لا يوجد مخزون مسجل.")
 
-    if any(word in msg for word in ["مشاريع", "projects", "عملاء", "قيد التنفيذ"]):
-        return jsonify({"answer": f"عدد المشاريع قيد التنفيذ حالياً هو {metrics['active_projects']} مشروع."})
+    if any(w in question for w in ["أفضل", "افضل", "مبيع", "منتج"]):
+        rows = qa("SELECT product_name,SUM(qty) q,SUM(price*qty) s FROM invoice_items GROUP BY product_name ORDER BY q DESC,s DESC LIMIT 5")
+        return jsonify(answer=("أفضل المنتجات: " + "، ".join(f"{r['product_name']} ({r['q']} قطعة / {money(r['s'])})" for r in rows)) if rows else "لا توجد مبيعات بعد.")
 
-    if any(word in msg for word in ["مخزون", "stock", "كمية", "متوفر", "available"]):
-        matched = None
-        for item in inventory_rows:
-            name = item["name"].lower()
-            if name and name in msg:
-                matched = item
-                break
-            for token in name.split():
-                if len(token) >= 3 and token in msg:
-                    matched = item
-                    break
-            if matched:
-                break
-
-        if matched:
-            return jsonify(
-                {
-                    "answer": (
-                        f"مخزون {matched['name']} هو {matched['qty']} قطعة. "
-                        f"سعر البيع الحالي {format_money(matched['price'])} والتكلفة {format_money(matched['cost'])}."
-                    )
-                }
-            )
-
-        total_pieces = metrics["inventory_pieces"]
-        low_stock = [f"{row['name']} ({row['qty']})" for row in inventory_rows if row["qty"] <= 5]
-        low_stock_text = "، ".join(low_stock[:8]) if low_stock else "لا توجد منتجات منخفضة المخزون."
-        return jsonify({"answer": f"إجمالي قطع المخزون هو {total_pieces}. المنتجات منخفضة المخزون: {low_stock_text}"})
-
-    return jsonify(
-        {
-            "answer": (
-                "يمكنني الإجابة عن: صافي الربح، إجمالي المبيعات، المصروفات، عدد المشاريع النشطة، "
-                "أو كمية مخزون منتج معين. جرّب: كم مخزون البطاريات؟"
-            )
-        }
-    )
+    return jsonify(answer="يمكنني حساب الأرباح، المبيعات، المصروفات، المخزون، وأفضل المنتجات من البيانات الحية.")
 
 
-@app.route("/inventory")
+@app.route("/inventory", methods=["GET", "POST"])
 @login_required
 def inventory():
-    items = get_db().execute("SELECT * FROM inventory ORDER BY id DESC").fetchall()
-    template = """
-    <div class="grid xl:grid-cols-3 gap-6">
-        <form method="post" action="{{ url_for('inventory_create') }}" class="glass rounded-3xl p-6 shadow-soft">
-            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-            <h2 class="text-xl font-black mb-1">إضافة منتج شمسي</h2>
-            <p class="text-sm text-slate-400 mb-5">سجّل صنف جديد داخل المستودع.</p>
-
-            <div class="space-y-4">
-                <label class="block">
-                    <span class="text-sm text-slate-300 font-bold">اسم المنتج</span>
-                    <input class="input mt-2" name="name" required maxlength="180">
-                </label>
-                <label class="block">
-                    <span class="text-sm text-slate-300 font-bold">التصنيف</span>
-                    <input class="input mt-2" name="category" placeholder="ألواح / بطاريات / انفرترات..." maxlength="120">
-                </label>
-                <div class="grid grid-cols-3 gap-3">
-                    <label class="block">
-                        <span class="text-sm text-slate-300 font-bold">الكمية</span>
-                        <input class="input mt-2" type="number" name="qty" min="0" step="1" required>
-                    </label>
-                    <label class="block">
-                        <span class="text-sm text-slate-300 font-bold">التكلفة</span>
-                        <input class="input mt-2" type="number" name="cost" min="0" step="0.01" required>
-                    </label>
-                    <label class="block">
-                        <span class="text-sm text-slate-300 font-bold">سعر البيع</span>
-                        <input class="input mt-2" type="number" name="price" min="0" step="0.01" required>
-                    </label>
-                </div>
-                <button class="btn btn-primary w-full"><i class="fa-solid fa-plus"></i> حفظ المنتج</button>
-            </div>
-        </form>
-
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
-                <div>
-                    <h2 class="text-xl font-black">المخزون الحالي</h2>
-                    <p class="text-sm text-slate-400">تعديل كامل للاسم، الكمية، التكلفة، وسعر البيع.</p>
-                </div>
-                <div class="rounded-2xl bg-slate-900/70 border border-slate-700/60 px-4 py-3 text-sm">
-                    عدد الأصناف: <span class="font-black text-sky-300">{{ items|length }}</span>
-                </div>
-            </div>
-
-            <div class="overflow-x-auto scrollbar-thin">
-                <table class="w-full text-sm min-w-[900px]">
-                    <thead>
-                        <tr class="table-head border-b border-slate-700/70">
-                            <th class="py-3 text-right">المنتج</th>
-                            <th class="py-3 text-right">التصنيف</th>
-                            <th class="py-3 text-right">الكمية</th>
-                            <th class="py-3 text-right">التكلفة</th>
-                            <th class="py-3 text-right">البيع</th>
-                            <th class="py-3 text-right">القيمة بالمخزن</th>
-                            <th class="py-3 text-right">إجراءات</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for item in items %}
-                        <tr class="border-b border-slate-800/70 align-top">
-                            <form method="post" action="{{ url_for('inventory_update', item_id=item.id) }}">
-                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                <td class="py-3 pl-3"><input class="input" name="name" value="{{ item.name }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" name="category" value="{{ item.category }}"></td>
-                                <td class="py-3 pl-3"><input class="input" type="number" min="0" step="1" name="qty" value="{{ item.qty }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" type="number" min="0" step="0.01" name="cost" value="{{ item.cost }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" type="number" min="0" step="0.01" name="price" value="{{ item.price }}" required></td>
-                                <td class="py-3 font-black text-emerald-300">{{ (item.qty * item.cost)|money }}</td>
-                                <td class="py-3">
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-muted py-2 px-3"><i class="fa-solid fa-floppy-disk"></i></button>
-                            </form>
-                                        <form method="post" action="{{ url_for('inventory_delete', item_id=item.id) }}" onsubmit="return confirmDelete('حذف المنتج من المخزون؟')">
-                                            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                            <button class="btn btn-danger py-2 px-3"><i class="fa-solid fa-trash"></i></button>
-                                        </form>
-                                    </div>
-                                </td>
-                        </tr>
-                        {% else %}
-                        <tr><td colspan="7" class="py-10 text-center text-slate-500">لا توجد منتجات بعد.</td></tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-    """
-    return render_page("المستودع والمخزن", "inventory", template, items=items)
-
-
-@app.route("/inventory/create", methods=["POST"])
-@login_required
-def inventory_create():
-    try:
-        name = clean_text(request.form.get("name"), "اسم المنتج", max_len=180)
-        category = clean_text(request.form.get("category"), "التصنيف", max_len=120, required=False)
-        qty = parse_int(request.form.get("qty"), "الكمية", minimum=0)
-        cost = parse_money(request.form.get("cost"), "التكلفة", minimum=0)
-        price = parse_money(request.form.get("price"), "سعر البيع", minimum=0)
-        get_db().execute(
-            "INSERT INTO inventory (name, category, qty, cost, price) VALUES (?, ?, ?, ?, ?)",
-            (name, category, qty, cost, price),
-        )
-        get_db().commit()
-        flash("تمت إضافة المنتج بنجاح.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
-    return redirect(url_for("inventory"))
-
-
-@app.route("/inventory/<int:item_id>/update", methods=["POST"])
-@login_required
-def inventory_update(item_id):
-    try:
-        existing = get_db().execute("SELECT id FROM inventory WHERE id = ?", (item_id,)).fetchone()
-        if existing is None:
-            abort(404)
-        name = clean_text(request.form.get("name"), "اسم المنتج", max_len=180)
-        category = clean_text(request.form.get("category"), "التصنيف", max_len=120, required=False)
-        qty = parse_int(request.form.get("qty"), "الكمية", minimum=0)
-        cost = parse_money(request.form.get("cost"), "التكلفة", minimum=0)
-        price = parse_money(request.form.get("price"), "سعر البيع", minimum=0)
-        get_db().execute(
-            "UPDATE inventory SET name = ?, category = ?, qty = ?, cost = ?, price = ? WHERE id = ?",
-            (name, category, qty, cost, price, item_id),
-        )
-        get_db().commit()
-        flash("تم تحديث المنتج.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
-    return redirect(url_for("inventory"))
-
-
-@app.route("/inventory/<int:item_id>/delete", methods=["POST"])
-@login_required
-def inventory_delete(item_id):
-    get_db().execute("DELETE FROM inventory WHERE id = ?", (item_id,))
-    get_db().commit()
-    flash("تم حذف المنتج.", "success")
-    return redirect(url_for("inventory"))
-
-
-@app.route("/sales")
-@login_required
-def sales():
-    products = get_db().execute(
-        "SELECT id, name, category, qty, cost, price FROM inventory ORDER BY name ASC"
-    ).fetchall()
-    invoices = get_db().execute(
-        "SELECT id, customer_name, customer_phone, date, labor_cost, expenses_cost, grand_total FROM invoices ORDER BY id DESC"
-    ).fetchall()
-    products_json = json.dumps([dict(row) for row in products], ensure_ascii=False)
-
-    template = """
-    <div class="grid xl:grid-cols-5 gap-6">
-        <form method="post" action="{{ url_for('invoice_create') }}" class="xl:col-span-3 glass rounded-3xl p-6 shadow-soft" id="invoiceForm">
-            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-            <div class="flex items-center justify-between mb-5">
-                <div>
-                    <h2 class="text-xl font-black">إنشاء فاتورة متعددة الأصناف</h2>
-                    <p class="text-sm text-slate-400">اختر أكثر من منتج مع خصم الكمية تلقائياً من المخزون.</p>
-                </div>
-                <button type="button" onclick="addInvoiceRow()" class="btn btn-muted"><i class="fa-solid fa-plus"></i> إضافة صنف</button>
-            </div>
-
-            <div class="grid md:grid-cols-2 gap-4 mb-5">
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">اسم العميل</span>
-                    <input class="input mt-2" name="customer_name" required maxlength="180">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">هاتف العميل</span>
-                    <input class="input mt-2" name="customer_phone" maxlength="80">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">أجور التركيب</span>
-                    <input class="input mt-2" type="number" name="labor_cost" id="laborCost" min="0" step="0.01" value="0" oninput="recalculateInvoice()">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">مصروفات مباشرة داخلية</span>
-                    <input class="input mt-2" type="number" name="expenses_cost" id="expensesCost" min="0" step="0.01" value="0" oninput="recalculateInvoice()">
-                </label>
-            </div>
-
-            <div class="overflow-x-auto scrollbar-thin rounded-3xl border border-slate-800">
-                <table class="w-full text-sm min-w-[780px]">
-                    <thead class="bg-slate-900/80">
-                        <tr class="table-head">
-                            <th class="p-3 text-right">المنتج</th>
-                            <th class="p-3 text-right">المخزون</th>
-                            <th class="p-3 text-right">الكمية</th>
-                            <th class="p-3 text-right">سعر البيع</th>
-                            <th class="p-3 text-right">الإجمالي</th>
-                            <th class="p-3 text-right">حذف</th>
-                        </tr>
-                    </thead>
-                    <tbody id="invoiceItems"></tbody>
-                </table>
-            </div>
-
-            <div class="mt-5 grid md:grid-cols-3 gap-4">
-                <div class="rounded-3xl bg-slate-900/70 border border-slate-700/60 p-4">
-                    <div class="text-sm text-slate-400">إجمالي المنتجات</div>
-                    <div class="text-2xl font-black" id="productsTotal">$0.00</div>
-                </div>
-                <div class="rounded-3xl bg-slate-900/70 border border-slate-700/60 p-4">
-                    <div class="text-sm text-slate-400">الإجمالي النهائي للعميل</div>
-                    <div class="text-2xl font-black text-emerald-300" id="grandTotal">$0.00</div>
-                </div>
-                <div class="rounded-3xl bg-slate-900/70 border border-slate-700/60 p-4">
-                    <div class="text-sm text-slate-400">ملاحظة</div>
-                    <div class="text-xs text-slate-400 mt-2">المصروفات المباشرة لا تُضاف إلى إجمالي العميل، لكنها تخصم من الأرباح.</div>
-                </div>
-            </div>
-
-            <button class="btn btn-primary w-full mt-5"><i class="fa-solid fa-file-circle-plus"></i> حفظ الفاتورة وخصم المخزون</button>
-        </form>
-
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <h2 class="text-xl font-black mb-1">المنتجات المتاحة</h2>
-            <p class="text-sm text-slate-400 mb-5">قائمة سريعة بالمخزون الحي.</p>
-            <div class="space-y-3 max-h-[580px] overflow-y-auto scrollbar-thin">
-                {% for product in products %}
-                <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-4">
-                    <div class="flex items-center justify-between gap-3">
-                        <div>
-                            <div class="font-black">{{ product.name }}</div>
-                            <div class="text-xs text-slate-500">{{ product.category }}</div>
-                        </div>
-                        <div class="text-left">
-                            <div class="text-xl font-black {{ 'text-rose-300' if product.qty <= 0 else 'text-emerald-300' }}">{{ product.qty }}</div>
-                            <div class="text-xs text-slate-500">{{ product.price|money }}</div>
-                        </div>
-                    </div>
-                </div>
-                {% else %}
-                <div class="text-center text-slate-500 py-8">أضف منتجات للمخزون أولاً.</div>
-                {% endfor %}
-            </div>
-        </div>
-    </div>
-
-    <div class="glass rounded-3xl p-6 shadow-soft mt-6">
-        <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
-            <div>
-                <h2 class="text-xl font-black">كل الفواتير السابقة</h2>
-                <p class="text-sm text-slate-400">عرض وتصدير أي فاتورة إلى Excel أو PDF.</p>
-            </div>
-        </div>
-        <div class="overflow-x-auto scrollbar-thin">
-            <table class="w-full text-sm min-w-[980px]">
-                <thead>
-                    <tr class="table-head border-b border-slate-700/70">
-                        <th class="py-3 text-right">#</th>
-                        <th class="py-3 text-right">العميل</th>
-                        <th class="py-3 text-right">الهاتف</th>
-                        <th class="py-3 text-right">التاريخ</th>
-                        <th class="py-3 text-right">الأجور</th>
-                        <th class="py-3 text-right">مصروفات مباشرة</th>
-                        <th class="py-3 text-right">الإجمالي</th>
-                        <th class="py-3 text-right">إجراءات</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for inv in invoices %}
-                    <tr class="border-b border-slate-800/70 hover:bg-slate-800/35">
-                        <td class="py-3 font-bold">{{ inv.id }}</td>
-                        <td class="py-3">{{ inv.customer_name }}</td>
-                        <td class="py-3 text-slate-400">{{ inv.customer_phone }}</td>
-                        <td class="py-3 text-slate-400">{{ inv.date }}</td>
-                        <td class="py-3">{{ inv.labor_cost|money }}</td>
-                        <td class="py-3">{{ inv.expenses_cost|money }}</td>
-                        <td class="py-3 font-black text-emerald-300">{{ inv.grand_total|money }}</td>
-                        <td class="py-3">
-                            <div class="flex flex-wrap gap-2">
-                                <a class="btn btn-muted py-2 px-3" href="{{ url_for('invoice_view', invoice_id=inv.id) }}"><i class="fa-solid fa-eye"></i></a>
-                                <a class="btn btn-muted py-2 px-3" href="{{ url_for('invoice_export_xlsx', invoice_id=inv.id) }}"><i class="fa-solid fa-file-excel"></i> Excel</a>
-                                <a class="btn btn-muted py-2 px-3" href="{{ url_for('invoice_export_pdf', invoice_id=inv.id) }}"><i class="fa-solid fa-file-pdf"></i> PDF</a>
-                            </div>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr><td colspan="8" class="py-10 text-center text-slate-500">لا توجد فواتير بعد.</td></tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    """
-
-    extra_js = """
-    <script>
-        const products = """ + products_json + """;
-
-        function money(n) {
-            return '$' + Number(n || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-        }
-
-        function productOptions() {
-            return '<option value="">اختر المنتج</option>' + products.map(p => {
-                const disabled = Number(p.qty) <= 0 ? 'disabled' : '';
-                return `<option value="${p.id}" data-stock="${p.qty}" data-price="${p.price}" data-cost="${p.cost}" ${disabled}>${p.name} — المتاح: ${p.qty}</option>`;
-            }).join('');
-        }
-
-        function addInvoiceRow() {
-            const tbody = document.getElementById('invoiceItems');
-            const tr = document.createElement('tr');
-            tr.className = 'border-b border-slate-800/70';
-            tr.innerHTML = `
-                <td class="p-3">
-                    <select class="input product-select" name="product_id[]" required onchange="syncProductRow(this)">
-                        ${productOptions()}
-                    </select>
-                </td>
-                <td class="p-3 text-slate-300 stock-label">—</td>
-                <td class="p-3"><input class="input qty-input" type="number" name="item_qty[]" min="1" step="1" value="1" required oninput="recalculateInvoice()"></td>
-                <td class="p-3"><input class="input price-input" type="number" name="item_price[]" min="0" step="0.01" value="0" required oninput="recalculateInvoice()"></td>
-                <td class="p-3 font-black text-emerald-300 line-total">$0.00</td>
-                <td class="p-3"><button type="button" class="btn btn-danger py-2 px-3" onclick="this.closest('tr').remove(); recalculateInvoice();"><i class="fa-solid fa-xmark"></i></button></td>
-            `;
-            tbody.appendChild(tr);
-        }
-
-        function syncProductRow(select) {
-            const row = select.closest('tr');
-            const selected = select.options[select.selectedIndex];
-            const stock = selected.dataset.stock || 0;
-            const price = selected.dataset.price || 0;
-            row.querySelector('.stock-label').textContent = stock;
-            const qtyInput = row.querySelector('.qty-input');
-            qtyInput.max = stock;
-            if (Number(qtyInput.value || 0) > Number(stock)) qtyInput.value = stock;
-            row.querySelector('.price-input').value = Number(price).toFixed(2);
-            recalculateInvoice();
-        }
-
-        function recalculateInvoice() {
-            let productsTotal = 0;
-            document.querySelectorAll('#invoiceItems tr').forEach(row => {
-                const qty = Number(row.querySelector('.qty-input')?.value || 0);
-                const price = Number(row.querySelector('.price-input')?.value || 0);
-                const total = qty * price;
-                productsTotal += total;
-                row.querySelector('.line-total').textContent = money(total);
-            });
-            const labor = Number(document.getElementById('laborCost').value || 0);
-            document.getElementById('productsTotal').textContent = money(productsTotal);
-            document.getElementById('grandTotal').textContent = money(productsTotal + labor);
-        }
-
-        addInvoiceRow();
-    </script>
-    """
-    return render_page("المبيعات والفواتير", "sales", template, extra_js=extra_js, products=products, invoices=invoices)
-
-
-@app.route("/invoices/create", methods=["POST"])
-@login_required
-def invoice_create():
-    db = get_db()
-    try:
-        customer_name = clean_text(request.form.get("customer_name"), "اسم العميل", max_len=180)
-        customer_phone = clean_text(request.form.get("customer_phone"), "هاتف العميل", max_len=80, required=False)
-        labor_cost = parse_money(request.form.get("labor_cost"), "أجور التركيب", minimum=0)
-        expenses_cost = parse_money(request.form.get("expenses_cost"), "المصروفات المباشرة", minimum=0)
-
-        product_ids = request.form.getlist("product_id[]")
-        quantities = request.form.getlist("item_qty[]")
-        prices = request.form.getlist("item_price[]")
-
-        if not product_ids:
-            raise ValueError("يجب إضافة صنف واحد على الأقل للفاتورة.")
-
-        if not (len(product_ids) == len(quantities) == len(prices)):
-            raise ValueError("بيانات الأصناف غير مكتملة.")
-
-        items = []
-        sold_by_product = {}
-
-        for index, raw_product_id in enumerate(product_ids):
-            product_id = parse_int(raw_product_id, "المنتج", minimum=1)
-            qty = parse_int(quantities[index], "كمية الصنف", minimum=1)
-            price = parse_money(prices[index], "سعر الصنف", minimum=0)
-
-            product = db.execute(
-                "SELECT id, name, qty, cost, price FROM inventory WHERE id = ?",
-                (product_id,),
-            ).fetchone()
-            if product is None:
-                raise ValueError("أحد المنتجات المختارة غير موجود.")
-            if product["qty"] <= 0:
-                raise ValueError(f"المنتج {product['name']} غير متوفر في المخزون.")
-
-            sold_by_product[product_id] = sold_by_product.get(product_id, 0) + qty
-            if sold_by_product[product_id] > product["qty"]:
-                raise ValueError(f"الكمية المطلوبة من {product['name']} أكبر من المتاح في المخزون.")
-
-            items.append(
-                {
-                    "product_id": product_id,
-                    "product_name": product["name"],
-                    "qty": qty,
-                    "price": price,
-                    "cost": float(product["cost"]),
-                }
-            )
-
-        products_total = sum(item["qty"] * item["price"] for item in items)
-        grand_total = round(products_total + labor_cost, 2)
-        invoice_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        db.execute("BEGIN IMMEDIATE")
-        cursor = db.execute(
-            """
-            INSERT INTO invoices (customer_name, customer_phone, date, labor_cost, expenses_cost, grand_total)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (customer_name, customer_phone, invoice_date, labor_cost, expenses_cost, grand_total),
-        )
-        invoice_id = cursor.lastrowid
-
-        for item in items:
-            db.execute(
-                """
-                INSERT INTO invoice_items (invoice_id, product_id, product_name, qty, price, cost)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
+    if request.method == "POST":
+        try:
+            get_db().execute(
+                "INSERT INTO inventory(name,category,qty,cost,price) VALUES(?,?,?,?,?)",
                 (
-                    invoice_id,
-                    item["product_id"],
-                    item["product_name"],
-                    item["qty"],
-                    item["price"],
-                    item["cost"],
+                    clean(request.form.get("name"), 160),
+                    clean(request.form.get("category"), 120, False) or "عام",
+                    qty(request.form.get("qty")),
+                    amount(request.form.get("cost"), "التكلفة"),
+                    amount(request.form.get("price"), "سعر البيع"),
                 ),
             )
-            db.execute(
-                "UPDATE inventory SET qty = qty - ? WHERE id = ?",
-                (item["qty"], item["product_id"]),
-            )
+            flash("تمت إضافة المنتج.", "success")
+        except Exception as e:
+            flash(str(e), "error")
+        return redirect(url_for("inventory"))
 
-        db.commit()
-        backup_db_after_invoice()
-        flash(f"تم إنشاء الفاتورة #{invoice_id} ونسخ قاعدة البيانات احتياطياً.", "success")
-    except ValueError as exc:
-        db.rollback()
-        flash(str(exc), "error")
-    except sqlite3.Error as exc:
-        db.rollback()
-        flash(f"خطأ في قاعدة البيانات: {exc}", "error")
+    rows = qa("SELECT * FROM inventory ORDER BY name")
+    body = """
+    <section class="glass mb-6 rounded-3xl p-5">
+    <h3 class="mb-4 font-black">إضافة منتج شمسي</h3>
+    <form method="post" class="grid gap-3 md:grid-cols-6">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <input name="name" required class="soft rounded-2xl px-4 py-3 md:col-span-2" placeholder="اسم المنتج">
+    <input name="category" class="soft rounded-2xl px-4 py-3" placeholder="التصنيف">
+    <input name="qty" type="number" min="0" required class="soft rounded-2xl px-4 py-3" placeholder="الكمية">
+    <input name="cost" type="number" min="0" step="0.01" required class="soft rounded-2xl px-4 py-3" placeholder="التكلفة">
+    <input name="price" type="number" min="0" step="0.01" required class="soft rounded-2xl px-4 py-3" placeholder="سعر البيع">
+    <button class="gold rounded-2xl px-5 py-3 md:col-span-6">حفظ</button>
+    </form>
+    </section>
 
-    return redirect(url_for("sales"))
+    <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto">
+    <table class="min-w-full text-sm">
+    <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">المنتج</th><th class="p-4 text-right">التصنيف</th><th class="p-4 text-right">المتبقي</th><th class="p-4 text-right">التكلفة</th><th class="p-4 text-right">السعر</th><th class="p-4"></th></tr></thead>
+    <tbody>
+    {% for x in rows %}
+    <tr class="tr border-t border-white/5">
+    <form method="post" action="{{url_for('inventory_update',id=x.id)}}">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <td class="p-3"><input name="name" value="{{x.name}}" class="soft w-56 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="category" value="{{x.category}}" class="soft w-36 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="qty" type="number" min="0" value="{{x.qty}}" class="soft w-24 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="cost" type="number" min="0" step="0.01" value="{{x.cost}}" class="soft w-32 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="price" type="number" min="0" step="0.01" value="{{x.price}}" class="soft w-32 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><div class="flex gap-2"><button class="rounded-xl bg-emerald-500/15 px-3 py-2 text-emerald-200"><i class="fa-solid fa-check"></i></button></form>
+    <form method="post" action="{{url_for('inventory_delete',id=x.id)}}" onsubmit="return delmsg('هل تريد حذف المنتج؟')"><input type="hidden" name="_csrf_token" value="{{csrf_token()}}"><button class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200"><i class="fa-solid fa-trash"></i></button></form></div></td>
+    </tr>
+    {% else %}<tr><td colspan="6" class="p-8 text-center text-slate-400">لا توجد منتجات.</td></tr>{% endfor %}
+    </tbody></table></div></section>
+    """
+    return page("المستودع والمخزن", body, "inventory", rows=rows)
 
 
-def get_invoice_with_items(invoice_id):
-    invoice = get_db().execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
-    if invoice is None:
+@app.route("/inventory/<int:id>/update", methods=["POST"])
+@login_required
+def inventory_update(id):
+    try:
+        get_db().execute(
+            "UPDATE inventory SET name=?,category=?,qty=?,cost=?,price=? WHERE id=?",
+            (
+                clean(request.form.get("name"), 160),
+                clean(request.form.get("category"), 120, False) or "عام",
+                qty(request.form.get("qty")),
+                amount(request.form.get("cost"), "التكلفة"),
+                amount(request.form.get("price"), "سعر البيع"),
+                id,
+            ),
+        )
+        flash("تم تحديث المنتج.", "success")
+    except Exception as e:
+        flash(str(e), "error")
+    return redirect(url_for("inventory"))
+
+
+@app.route("/inventory/<int:id>/delete", methods=["POST"])
+@login_required
+def inventory_delete(id):
+    if q1("SELECT COUNT(*) c FROM invoice_items WHERE product_id=?", (id,))["c"]:
+        flash("لا يمكن حذف منتج مرتبط بفواتير؛ يمكنك تصفير الكمية.", "error")
+    else:
+        get_db().execute("DELETE FROM inventory WHERE id=?", (id,))
+        flash("تم حذف المنتج.", "success")
+    return redirect(url_for("inventory"))
+
+
+@app.route("/invoices")
+@login_required
+def invoices():
+    rows = qa("SELECT * FROM invoices ORDER BY id DESC")
+    body = """
+    <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <div><h3 class="text-xl font-black">المبيعات والفواتير</h3><p class="text-sm text-slate-400">فواتير متعددة الأصناف مع خصم مباشر من المخزون.</p></div>
+    <a class="gold rounded-2xl px-5 py-3" href="{{url_for('invoice_new')}}"><i class="fa-solid fa-plus ml-2"></i>فاتورة جديدة</a>
+    </div>
+
+    <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto"><table class="min-w-full text-sm">
+    <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">#</th><th class="p-4 text-right">العميل</th><th class="p-4 text-right">الهاتف</th><th class="p-4 text-right">التاريخ</th><th class="p-4 text-right">الإجمالي</th><th class="p-4 text-right">تصدير</th></tr></thead>
+    <tbody>
+    {% for i in rows %}
+    <tr class="tr border-t border-white/5">
+    <td class="p-4 font-black">#{{i.id}}</td>
+    <td class="p-4"><a class="font-bold text-gold" href="{{url_for('invoice_detail',invoice_id=i.id)}}">{{i.customer_name}}</a></td>
+    <td class="p-4">{{i.customer_phone or '-'}}</td>
+    <td class="p-4">{{i.date}}</td>
+    <td class="p-4 font-black">{{i.grand_total|money}}</td>
+    <td class="p-4"><div class="flex flex-wrap gap-2">
+    <a class="rounded-xl bg-emerald-500/15 px-3 py-2 text-emerald-200" href="{{url_for('invoice_excel',invoice_id=i.id)}}">Excel</a>
+    <a class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200" href="{{url_for('invoice_pdf',invoice_id=i.id)}}">PDF</a>
+    <a class="rounded-xl bg-sky-500/15 px-3 py-2 text-sky-200" target="_blank" href="{{url_for('invoice_print',invoice_id=i.id)}}">طباعة</a>
+    </div></td>
+    </tr>
+    {% else %}<tr><td colspan="6" class="p-8 text-center text-slate-400">لا توجد فواتير.</td></tr>{% endfor %}
+    </tbody></table></div></section>
+    """
+    return page("المبيعات والفواتير", body, "invoices", rows=rows)
+
+
+@app.route("/invoices/new", methods=["GET", "POST"])
+@login_required
+def invoice_new():
+    if request.method == "POST":
+        try:
+            customer = clean(request.form.get("customer_name"), 160)
+            phone = clean(request.form.get("customer_phone"), 80, False)
+            inv_date = request.form.get("date") or today()
+            labor = amount(request.form.get("labor_cost"), "أجور التركيب")
+            inv_exp = amount(request.form.get("expenses_cost"), "مصروفات الفاتورة")
+            pids = request.form.getlist("product_id[]")
+            qs = request.form.getlist("qty[]")
+            prices = request.form.getlist("price[]")
+            lines = []
+            for pid, qv, pv in zip(pids, qs, prices):
+                if pid:
+                    lines.append({"pid": qty(pid, "المنتج", 1), "qty": qty(qv, "كمية الصنف", 1), "price": amount(pv, "سعر الصنف")})
+            if not lines:
+                raise ValueError("أضف صنفاً واحداً على الأقل.")
+
+            con = get_db()
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                stock = {}
+                for line in lines:
+                    item = con.execute("SELECT * FROM inventory WHERE id=?", (line["pid"],)).fetchone()
+                    if not item:
+                        raise ValueError("يوجد منتج غير موجود.")
+                    stock.setdefault(item["id"], {"item": item, "need": 0})["need"] += line["qty"]
+
+                for data in stock.values():
+                    if data["need"] > data["item"]["qty"]:
+                        raise ValueError(f"الكمية المطلوبة من {data['item']['name']} أكبر من المتاح ({data['item']['qty']}).")
+
+                total = round(sum(l["qty"] * l["price"] for l in lines) + labor + inv_exp, 2)
+                cur = con.execute(
+                    "INSERT INTO invoices(customer_name,customer_phone,date,labor_cost,expenses_cost,grand_total) VALUES(?,?,?,?,?,?)",
+                    (customer, phone, inv_date, labor, inv_exp, total),
+                )
+                invoice_id = cur.lastrowid
+
+                for line in lines:
+                    item = stock[line["pid"]]["item"]
+                    con.execute(
+                        "INSERT INTO invoice_items(invoice_id,product_id,product_name,qty,price,cost) VALUES(?,?,?,?,?,?)",
+                        (invoice_id, item["id"], item["name"], line["qty"], line["price"], item["cost"]),
+                    )
+                    con.execute("UPDATE inventory SET qty=qty-? WHERE id=?", (line["qty"], item["id"]))
+
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
+
+            backup_db()
+            flash("تم إنشاء الفاتورة ونسخة احتياطية للمخزون والبيانات.", "success")
+            return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+
+        except Exception as e:
+            flash(str(e), "error")
+            return redirect(url_for("invoice_new"))
+
+    products = qa("SELECT * FROM inventory WHERE qty>0 ORDER BY name")
+    body = """
+    <section class="glass rounded-3xl p-5">
+    <form method="post" class="space-y-5">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <div class="grid gap-3 md:grid-cols-5">
+    <input name="customer_name" required class="soft rounded-2xl px-4 py-3 md:col-span-2" placeholder="اسم العميل">
+    <input name="customer_phone" class="soft rounded-2xl px-4 py-3" placeholder="الهاتف">
+    <input name="date" type="date" value="{{today}}" class="soft rounded-2xl px-4 py-3">
+    <input name="labor_cost" type="number" min="0" step="0.01" value="0" oninput="calc()" class="soft rounded-2xl px-4 py-3" placeholder="أجور التركيب">
+    <input name="expenses_cost" type="number" min="0" step="0.01" value="0" oninput="calc()" class="soft rounded-2xl px-4 py-3 md:col-span-5" placeholder="مصروفات محملة على الفاتورة">
+    </div>
+    <div class="overflow-x-auto rounded-3xl border border-white/10">
+    <table class="min-w-full text-sm"><thead class="bg-white/[.04]"><tr><th class="p-4 text-right">الصنف</th><th class="p-4 text-right">المتوفر</th><th class="p-4 text-right">الكمية</th><th class="p-4 text-right">السعر</th><th class="p-4 text-right">الإجمالي</th><th></th></tr></thead><tbody id="items"></tbody></table>
+    </div>
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+    <button type="button" onclick="addRow()" class="rounded-2xl border border-white/10 bg-white/5 px-5 py-3 font-bold">+ إضافة صنف</button>
+    <b class="rounded-2xl bg-gold/10 px-5 py-3 text-gold">إجمالي الفاتورة: <span id="gt">0</span> {{currency}}</b>
+    </div>
+    <button class="gold w-full rounded-2xl px-5 py-4 text-lg">حفظ الفاتورة</button>
+    </form>
+    </section>
+
+    <script>
+    const products={{products|safe}},cur={{currency|tojson}};
+    function opts(){return '<option value="">اختر المنتج</option>'+products.map(p=>`<option value="${p.id}" data-stock="${p.qty}" data-price="${p.price}">${p.name} — متوفر ${p.qty}</option>`).join('')}
+    function addRow(){let tr=document.createElement('tr');tr.className='border-t border-white/5 row';tr.innerHTML=`<td class="p-3"><select required onchange="sync(this)" name="product_id[]" class="soft min-w-72 rounded-xl px-3 py-2">${opts()}</select></td><td class="p-3 stock">-</td><td class="p-3"><input name="qty[]" type="number" min="1" value="1" oninput="calc()" class="soft w-24 rounded-xl px-3 py-2"></td><td class="p-3"><input name="price[]" type="number" min="0" step="0.01" value="0" oninput="calc()" class="soft w-36 rounded-xl px-3 py-2"></td><td class="p-3 line font-black">0 ${cur}</td><td class="p-3"><button type="button" onclick="this.closest('tr').remove();calc()" class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200">×</button></td>`;items.appendChild(tr)}
+    function sync(s){let o=s.selectedOptions[0],r=s.closest('tr');r.querySelector('.stock').textContent=o.dataset.stock||'-';r.querySelector('[name="qty[]"]').max=o.dataset.stock||'';r.querySelector('[name="price[]"]').value=o.dataset.price||0;calc()}
+    function calc(){let t=0;document.querySelectorAll('.row').forEach(r=>{let q=+r.querySelector('[name="qty[]"]').value||0,p=+r.querySelector('[name="price[]"]').value||0,l=q*p;r.querySelector('.line').textContent=nf(l)+' '+cur;t+=l});t+=(+document.querySelector('[name="labor_cost"]').value||0)+(+document.querySelector('[name="expenses_cost"]').value||0);gt.textContent=nf(t)}
+    addRow()
+    </script>
+    """
+    return page("فاتورة جديدة", body, "invoices", products=json.dumps([dict(x) for x in products], ensure_ascii=False), today=today(), currency=CURRENCY)
+
+
+def invoice_data(invoice_id):
+    inv = q1("SELECT * FROM invoices WHERE id=?", (invoice_id,))
+    if not inv:
         abort(404)
-    items = get_db().execute(
-        "SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY id ASC",
-        (invoice_id,),
-    ).fetchall()
-    return invoice, items
+    return inv, qa("SELECT * FROM invoice_items WHERE invoice_id=? ORDER BY id", (invoice_id,))
 
 
 @app.route("/invoices/<int:invoice_id>")
 @login_required
-def invoice_view(invoice_id):
-    invoice, items = get_invoice_with_items(invoice_id)
-    products_total = sum(item["qty"] * item["price"] for item in items)
-    profit = sum((item["price"] - item["cost"]) * item["qty"] for item in items) + invoice["labor_cost"] - invoice["expenses_cost"]
-
-    template = """
-    <div class="max-w-5xl mx-auto glass rounded-3xl p-6 md:p-8 shadow-soft">
-        <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-5 border-b border-slate-700/70 pb-6 mb-6">
-            <div>
-                <div class="text-sm text-sky-300 font-bold">فاتورة مبيعات</div>
-                <h2 class="text-3xl font-black">Invoice #{{ invoice.id }}</h2>
-                <p class="text-slate-400 mt-1">{{ invoice.date }}</p>
-            </div>
-            <div class="flex flex-wrap gap-2">
-                <a class="btn btn-muted" href="{{ url_for('invoice_export_xlsx', invoice_id=invoice.id) }}"><i class="fa-solid fa-file-excel"></i> Excel</a>
-                <a class="btn btn-muted" href="{{ url_for('invoice_export_pdf', invoice_id=invoice.id) }}"><i class="fa-solid fa-file-pdf"></i> PDF</a>
-                <button class="btn btn-primary" onclick="window.print()"><i class="fa-solid fa-print"></i> طباعة</button>
-            </div>
-        </div>
-
-        <div class="grid md:grid-cols-2 gap-4 mb-6">
-            <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                <div class="text-sm text-slate-400">اسم العميل</div>
-                <div class="text-xl font-black">{{ invoice.customer_name }}</div>
-            </div>
-            <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                <div class="text-sm text-slate-400">الهاتف</div>
-                <div class="text-xl font-black">{{ invoice.customer_phone or '—' }}</div>
-            </div>
-        </div>
-
-        <div class="overflow-x-auto scrollbar-thin rounded-3xl border border-slate-800 mb-6">
-            <table class="w-full text-sm min-w-[760px]">
-                <thead class="bg-slate-900/85">
-                    <tr class="table-head">
-                        <th class="p-3 text-right">الصنف</th>
-                        <th class="p-3 text-right">الكمية</th>
-                        <th class="p-3 text-right">سعر البيع</th>
-                        <th class="p-3 text-right">التكلفة</th>
-                        <th class="p-3 text-right">الإجمالي</th>
-                        <th class="p-3 text-right">الربح</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for item in items %}
-                    <tr class="border-b border-slate-800/70">
-                        <td class="p-3 font-bold">{{ item.product_name }}</td>
-                        <td class="p-3">{{ item.qty }}</td>
-                        <td class="p-3">{{ item.price|money }}</td>
-                        <td class="p-3">{{ item.cost|money }}</td>
-                        <td class="p-3 text-emerald-300 font-black">{{ (item.price * item.qty)|money }}</td>
-                        <td class="p-3 text-sky-300 font-black">{{ ((item.price - item.cost) * item.qty)|money }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-
-        <div class="grid md:grid-cols-4 gap-4">
-            <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                <div class="text-sm text-slate-400">إجمالي المنتجات</div>
-                <div class="text-2xl font-black">{{ products_total|money }}</div>
-            </div>
-            <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                <div class="text-sm text-slate-400">أجور التركيب</div>
-                <div class="text-2xl font-black">{{ invoice.labor_cost|money }}</div>
-            </div>
-            <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                <div class="text-sm text-slate-400">مصروفات مباشرة</div>
-                <div class="text-2xl font-black text-rose-300">{{ invoice.expenses_cost|money }}</div>
-            </div>
-            <div class="rounded-3xl bg-emerald-500/10 border border-emerald-400/20 p-5">
-                <div class="text-sm text-emerald-200">الإجمالي النهائي</div>
-                <div class="text-2xl font-black text-emerald-300">{{ invoice.grand_total|money }}</div>
-                <div class="text-xs text-slate-400 mt-2">ربح الفاتورة: {{ profit|money }}</div>
-            </div>
-        </div>
+def invoice_detail(invoice_id):
+    inv, items = invoice_data(invoice_id)
+    subtotal = sum(x["qty"] * x["price"] for x in items)
+    body = """
+    <section class="glass rounded-3xl p-6">
+    <div class="mb-5 flex flex-col gap-3 border-b border-white/10 pb-5 sm:flex-row sm:justify-between">
+    <div><h3 class="text-2xl font-black">فاتورة #{{inv.id}}</h3><p class="text-slate-400">{{inv.date}} · {{inv.customer_name}} · {{inv.customer_phone or '-'}}</p></div>
+    <div class="flex gap-2"><a class="rounded-xl bg-emerald-500/15 px-4 py-2 text-emerald-200" href="{{url_for('invoice_excel',invoice_id=inv.id)}}">Excel</a><a class="rounded-xl bg-red-500/15 px-4 py-2 text-red-200" href="{{url_for('invoice_pdf',invoice_id=inv.id)}}">PDF</a><a class="rounded-xl bg-sky-500/15 px-4 py-2 text-sky-200" target="_blank" href="{{url_for('invoice_print',invoice_id=inv.id)}}">طباعة</a></div>
     </div>
+    <div class="overflow-x-auto rounded-3xl border border-white/10"><table class="min-w-full text-sm">
+    <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">الصنف</th><th class="p-4 text-right">الكمية</th><th class="p-4 text-right">السعر</th><th class="p-4 text-right">الإجمالي</th></tr></thead>
+    <tbody>{% for x in items %}<tr class="border-t border-white/5"><td class="p-4 font-bold">{{x.product_name}}</td><td class="p-4">{{x.qty}}</td><td class="p-4">{{x.price|money}}</td><td class="p-4 font-black">{{(x.qty*x.price)|money}}</td></tr>{% endfor %}</tbody>
+    </table></div>
+    <div class="mt-5 grid gap-3 md:grid-cols-4">
+    <div class="rounded-2xl bg-white/5 p-4"><p class="text-sm text-slate-400">إجمالي المنتجات</p><b>{{subtotal|money}}</b></div>
+    <div class="rounded-2xl bg-white/5 p-4"><p class="text-sm text-slate-400">أجور التركيب</p><b>{{inv.labor_cost|money}}</b></div>
+    <div class="rounded-2xl bg-white/5 p-4"><p class="text-sm text-slate-400">مصروفات الفاتورة</p><b>{{inv.expenses_cost|money}}</b></div>
+    <div class="rounded-2xl bg-gold/10 p-4 text-gold"><p class="text-sm">الإجمالي النهائي</p><b class="text-xl">{{inv.grand_total|money}}</b></div>
+    </div>
+    </section>
     """
-    return render_page(
-        f"فاتورة #{invoice_id}",
-        "sales",
-        template,
-        invoice=invoice,
-        items=items,
-        products_total=products_total,
-        profit=profit,
+    return page(f"فاتورة #{invoice_id}", body, "invoices", inv=inv, items=items, subtotal=subtotal)
+
+
+@app.route("/invoices/<int:invoice_id>/print")
+@login_required
+def invoice_print(invoice_id):
+    inv, items = invoice_data(invoice_id)
+    subtotal = sum(x["qty"] * x["price"] for x in items)
+    return render_template_string("""
+    <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>فاتورة</title>
+    <style>body{font-family:Tahoma,Arial;margin:30px;color:#111}table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:9px;text-align:right}.no{margin-bottom:20px}@media print{.no{display:none}}</style>
+    </head><body><button class="no" onclick="print()">طباعة / حفظ PDF</button><h1>{{app_name}}</h1><h2>فاتورة #{{inv.id}}</h2>
+    <p>العميل: {{inv.customer_name}} | الهاتف: {{inv.customer_phone or '-'}} | التاريخ: {{inv.date}}</p>
+    <table><tr><th>الصنف</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr>{% for x in items %}<tr><td>{{x.product_name}}</td><td>{{x.qty}}</td><td>{{x.price|money}}</td><td>{{(x.qty*x.price)|money}}</td></tr>{% endfor %}</table>
+    <p>إجمالي المنتجات: {{subtotal|money}}</p><p>أجور التركيب: {{inv.labor_cost|money}}</p><p>مصروفات الفاتورة: {{inv.expenses_cost|money}}</p><h2>الإجمالي النهائي: {{inv.grand_total|money}}</h2>
+    </body></html>
+    """, app_name=APP_NAME, inv=inv, items=items, subtotal=subtotal)
+
+
+@app.route("/invoices/<int:invoice_id>/excel")
+@login_required
+def invoice_excel(invoice_id):
+    inv, items = invoice_data(invoice_id)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow([APP_NAME])
+    w.writerow(["فاتورة رقم", inv["id"]])
+    w.writerow(["العميل", inv["customer_name"], "الهاتف", inv["customer_phone"] or "", "التاريخ", inv["date"]])
+    w.writerow([])
+    w.writerow(["الصنف", "الكمية", "السعر", "التكلفة", "الإجمالي"])
+    for x in items:
+        w.writerow([x["product_name"], x["qty"], x["price"], x["cost"], round(x["qty"] * x["price"], 2)])
+    w.writerow([])
+    w.writerow(["أجور التركيب", inv["labor_cost"]])
+    w.writerow(["مصروفات الفاتورة", inv["expenses_cost"]])
+    w.writerow(["الإجمالي النهائي", inv["grand_total"]])
+    return Response(
+        out.getvalue().encode("utf-8-sig"),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=invoice_{invoice_id}.csv"},
     )
 
 
-def column_name(index):
-    result = ""
-    while index:
-        index, rem = divmod(index - 1, 26)
-        result = chr(65 + rem) + result
-    return result
+def pdf_escape(s):
+    return str(s).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def xml_escape(value):
-    return html.escape(str(value), quote=True)
-
-
-def make_xlsx(rows, sheet_name="Invoice"):
-    output = io.BytesIO()
-
-    sheet_rows = []
-    for r_index, row in enumerate(rows, start=1):
-        cells = []
-        for c_index, value in enumerate(row, start=1):
-            ref = f"{column_name(c_index)}{r_index}"
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
-            else:
-                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(value)}</t></is></c>')
-        sheet_rows.append(f'<row r="{r_index}">{"".join(cells)}</row>')
-
-    sheet_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-        <sheetViews><sheetView workbookViewId="0" rightToLeft="1"/></sheetViews>
-        <sheetFormatPr defaultRowHeight="18"/>
-        <cols>
-            <col min="1" max="1" width="24" customWidth="1"/>
-            <col min="2" max="8" width="18" customWidth="1"/>
-        </cols>
-        <sheetData>{''.join(sheet_rows)}</sheetData>
-    </worksheet>"""
-
-    workbook_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-        <sheets>
-            <sheet name="{xml_escape(sheet_name[:31])}" sheetId="1" r:id="rId1"/>
-        </sheets>
-    </workbook>"""
-
-    workbook_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-        <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-    </Relationships>"""
-
-    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-        <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-    </Relationships>"""
-
-    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-        <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-        <Default Extension="xml" ContentType="application/xml"/>
-        <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-        <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-    </Types>"""
-
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", root_rels)
-        zf.writestr("xl/workbook.xml", workbook_xml)
-        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
-
-    output.seek(0)
-    return output
-
-
-@app.route("/invoices/<int:invoice_id>/export/xlsx")
-@login_required
-def invoice_export_xlsx(invoice_id):
-    invoice, items = get_invoice_with_items(invoice_id)
-    products_total = sum(item["qty"] * item["price"] for item in items)
-
-    rows = [
-        [APP_NAME],
-        ["فاتورة رقم", invoice["id"]],
-        ["التاريخ", invoice["date"]],
-        ["اسم العميل", invoice["customer_name"]],
-        ["الهاتف", invoice["customer_phone"]],
-        [],
-        ["الصنف", "الكمية", "سعر البيع", "التكلفة", "إجمالي السطر", "ربح السطر"],
+def simple_pdf(lines):
+    y = 805
+    stream = ["BT", "0 0 0 rg"]
+    for text, size in lines:
+        stream.append(f"/F1 {size} Tf 1 0 0 1 42 {y} Tm ({pdf_escape(text)}) Tj")
+        y -= int(size * 1.8)
+        if y < 45:
+            break
+    stream.append("ET")
+    data = "\n".join(stream).encode("latin-1", "replace")
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(data)).encode() + b" >>\nstream\n" + data + b"\nendstream",
     ]
-
-    for item in items:
-        rows.append(
-            [
-                item["product_name"],
-                item["qty"],
-                item["price"],
-                item["cost"],
-                item["qty"] * item["price"],
-                (item["price"] - item["cost"]) * item["qty"],
-            ]
-        )
-
-    rows.extend(
-        [
-            [],
-            ["إجمالي المنتجات", products_total],
-            ["أجور التركيب", invoice["labor_cost"]],
-            ["مصروفات مباشرة داخلية", invoice["expenses_cost"]],
-            ["الإجمالي النهائي للعميل", invoice["grand_total"]],
-        ]
-    )
-
-    output = make_xlsx(rows, sheet_name=f"Invoice {invoice_id}")
-    filename = safe_filename(f"invoice_{invoice_id}_{invoice['customer_name']}.xlsx")
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def pdf_escape(value):
-    value = str(value).encode("latin-1", "replace").decode("latin-1")
-    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-
-
-def make_basic_pdf(lines):
-    width, height = 595, 842
-    y = height - 55
-    content_lines = ["BT", "/F1 11 Tf", "50 790 Td", "14 TL"]
-    for line in lines:
-        content_lines.append(f"({pdf_escape(line)}) Tj")
-        content_lines.append("T*")
-    content_lines.append("ET")
-    content = "\n".join(content_lines).encode("latin-1", "replace")
-
-    objects = []
-    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
-    objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-    objects.append(
-        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".encode()
-    )
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-    objects.append(f"<< /Length {len(content)} >>\nstream\n".encode() + content + b"\nendstream")
-
-    pdf = io.BytesIO()
-    pdf.write(b"%PDF-1.4\n")
+    pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
     offsets = [0]
-    for i, obj in enumerate(objects, start=1):
-        offsets.append(pdf.tell())
-        pdf.write(f"{i} 0 obj\n".encode())
-        pdf.write(obj)
-        pdf.write(b"\nendobj\n")
-
-    xref_position = pdf.tell()
-    pdf.write(f"xref\n0 {len(objects) + 1}\n".encode())
-    pdf.write(b"0000000000 65535 f \n")
-    for offset in offsets[1:]:
-        pdf.write(f"{offset:010d} 00000 n \n".encode())
-    pdf.write(f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_position}\n%%EOF".encode())
-    pdf.seek(0)
-    return pdf
+    for i, obj in enumerate(objs, 1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{i} 0 obj\n".encode())
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref = len(pdf)
+    pdf.extend(f"xref\n0 {len(objs)+1}\n0000000000 65535 f \n".encode())
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode())
+    pdf.extend(f"trailer << /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+    return bytes(pdf)
 
 
-def shape_arabic_text(text):
-    try:
-        import arabic_reshaper
-        from bidi.algorithm import get_display
-
-        return get_display(arabic_reshaper.reshape(str(text)))
-    except Exception:
-        return str(text)
-
-
-def make_invoice_pdf(invoice, items):
-    products_total = sum(item["qty"] * item["price"] for item in items)
-    profit = sum((item["price"] - item["cost"]) * item["qty"] for item in items) + invoice["labor_cost"] - invoice["expenses_cost"]
-
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        from reportlab.pdfgen import canvas
-
-        output = io.BytesIO()
-        c = canvas.Canvas(output, pagesize=A4)
-        width, height = A4
-
-        font_name = "Helvetica"
-        possible_fonts = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
-            str(BASE_DIR / "DejaVuSans.ttf"),
-        ]
-        for font_path in possible_fonts:
-            if Path(font_path).exists():
-                pdfmetrics.registerFont(TTFont("DejaVuSans", font_path))
-                font_name = "DejaVuSans"
-                break
-
-        def draw_right(text, x, y, size=11):
-            c.setFont(font_name, size)
-            display = shape_arabic_text(text)
-            c.drawRightString(x, y, display)
-
-        y = height - 50
-        draw_right(APP_NAME, width - 45, y, 18)
-        y -= 28
-        draw_right(f"فاتورة رقم: {invoice['id']}", width - 45, y, 14)
-        y -= 22
-        draw_right(f"التاريخ: {invoice['date']}", width - 45, y)
-        y -= 22
-        draw_right(f"العميل: {invoice['customer_name']}", width - 45, y)
-        y -= 22
-        draw_right(f"الهاتف: {invoice['customer_phone'] or '-'}", width - 45, y)
-
-        y -= 38
-        draw_right("الصنف | الكمية | البيع | التكلفة | الإجمالي", width - 45, y, 11)
-        y -= 16
-        c.line(45, y, width - 45, y)
-        y -= 18
-
-        for item in items:
-            line = (
-                f"{item['product_name']} | {item['qty']} | "
-                f"{format_money(item['price'])} | {format_money(item['cost'])} | "
-                f"{format_money(item['qty'] * item['price'])}"
-            )
-            draw_right(line, width - 45, y, 10)
-            y -= 18
-            if y < 90:
-                c.showPage()
-                y = height - 50
-
-        y -= 16
-        c.line(45, y, width - 45, y)
-        y -= 24
-        draw_right(f"إجمالي المنتجات: {format_money(products_total)}", width - 45, y)
-        y -= 20
-        draw_right(f"أجور التركيب: {format_money(invoice['labor_cost'])}", width - 45, y)
-        y -= 20
-        draw_right(f"مصروفات مباشرة داخلية: {format_money(invoice['expenses_cost'])}", width - 45, y)
-        y -= 20
-        draw_right(f"الإجمالي النهائي للعميل: {format_money(invoice['grand_total'])}", width - 45, y, 13)
-        y -= 20
-        draw_right(f"ربح الفاتورة: {format_money(profit)}", width - 45, y, 12)
-
-        c.save()
-        output.seek(0)
-        return output
-    except Exception:
-        lines = [
-            f"{APP_NAME} - Invoice #{invoice['id']}",
-            f"Date: {invoice['date']}",
-            f"Customer: {invoice['customer_name']}",
-            f"Phone: {invoice['customer_phone'] or '-'}",
-            "",
-            "Items:",
-        ]
-        for item in items:
-            lines.append(
-                f"{item['product_name']} | Qty {item['qty']} | Price {format_money(item['price'])} | Total {format_money(item['qty'] * item['price'])}"
-            )
-        lines.extend(
-            [
-                "",
-                f"Products Total: {format_money(products_total)}",
-                f"Labor Cost: {format_money(invoice['labor_cost'])}",
-                f"Direct Expenses: {format_money(invoice['expenses_cost'])}",
-                f"Grand Total: {format_money(invoice['grand_total'])}",
-                f"Invoice Profit: {format_money(profit)}",
-            ]
-        )
-        return make_basic_pdf(lines)
-
-
-@app.route("/invoices/<int:invoice_id>/export/pdf")
+@app.route("/invoices/<int:invoice_id>/pdf")
 @login_required
-def invoice_export_pdf(invoice_id):
-    invoice, items = get_invoice_with_items(invoice_id)
-    output = make_invoice_pdf(invoice, items)
-    filename = safe_filename(f"invoice_{invoice_id}_{invoice['customer_name']}.pdf")
-    return send_file(output, as_attachment=True, download_name=filename, mimetype="application/pdf")
+def invoice_pdf(invoice_id):
+    inv, items = invoice_data(invoice_id)
+    lines = [
+        (APP_NAME, 18),
+        (f"Invoice #{inv['id']} / فاتورة رقم {inv['id']}", 16),
+        (f"Customer: {inv['customer_name']} | Phone: {inv['customer_phone'] or '-'}", 12),
+        (f"Date: {inv['date']}", 12),
+        ("-" * 75, 10),
+    ]
+    for x in items:
+        lines.append((f"{x['product_name']} | Qty {x['qty']} | Price {money(x['price'])} | Total {money(x['qty']*x['price'])}", 11))
+    lines += [
+        ("-" * 75, 10),
+        (f"Labor: {money(inv['labor_cost'])}", 12),
+        (f"Invoice expenses: {money(inv['expenses_cost'])}", 12),
+        (f"Grand total: {money(inv['grand_total'])}", 15),
+    ]
+    return Response(
+        simple_pdf(lines),
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=invoice_{invoice_id}.pdf"},
+    )
 
 
-@app.route("/expenses")
+@app.route("/expenses", methods=["GET", "POST"])
 @login_required
 def expenses():
-    rows = get_db().execute("SELECT * FROM expenses ORDER BY date DESC, id DESC").fetchall()
-    total = scalar("SELECT COALESCE(SUM(amount), 0) FROM expenses")
-    today = datetime.now().strftime("%Y-%m-%d")
+    if request.method == "POST":
+        try:
+            get_db().execute(
+                "INSERT INTO expenses(description,amount,category,date) VALUES(?,?,?,?)",
+                (
+                    clean(request.form.get("description"), 220),
+                    amount(request.form.get("amount")),
+                    clean(request.form.get("category"), 120, False) or "عام",
+                    request.form.get("date") or today(),
+                ),
+            )
+            flash("تم تسجيل المصروف.", "success")
+        except Exception as e:
+            flash(str(e), "error")
+        return redirect(url_for("expenses"))
 
-    template = """
-    <div class="grid xl:grid-cols-3 gap-6">
-        <form method="post" action="{{ url_for('expense_create') }}" class="glass rounded-3xl p-6 shadow-soft">
-            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-            <h2 class="text-xl font-black mb-1">تسجيل مصروف</h2>
-            <p class="text-sm text-slate-400 mb-5">مصروفات تشغيلية، محل، أو مشروع.</p>
+    rows = qa("SELECT * FROM expenses ORDER BY date DESC,id DESC")
+    total = sum(float(x["amount"]) for x in rows)
+    body = """
+    <section class="glass mb-6 rounded-3xl p-5">
+    <div class="mb-4 flex justify-between"><h3 class="font-black">إضافة مصروف</h3><b class="text-red-200">الإجمالي: {{total|money}}</b></div>
+    <form method="post" class="grid gap-3 md:grid-cols-5">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <input name="description" required class="soft rounded-2xl px-4 py-3 md:col-span-2" placeholder="الوصف">
+    <input name="category" class="soft rounded-2xl px-4 py-3" placeholder="التصنيف">
+    <input name="amount" type="number" min="0" step="0.01" required class="soft rounded-2xl px-4 py-3" placeholder="المبلغ">
+    <input name="date" type="date" value="{{today}}" class="soft rounded-2xl px-4 py-3">
+    <button class="gold rounded-2xl px-5 py-3 md:col-span-5">حفظ</button>
+    </form>
+    </section>
 
-            <div class="space-y-4">
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">الوصف</span>
-                    <input class="input mt-2" name="description" required maxlength="255">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">التصنيف</span>
-                    <input class="input mt-2" name="category" placeholder="تشغيل / إيجار / مشروع..." maxlength="120">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">المبلغ</span>
-                    <input class="input mt-2" type="number" name="amount" min="0" step="0.01" required>
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">التاريخ</span>
-                    <input class="input mt-2" type="date" name="date" value="{{ today }}" required>
-                </label>
-                <button class="btn btn-primary w-full"><i class="fa-solid fa-plus"></i> حفظ المصروف</button>
-            </div>
-        </form>
-
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
-                <div>
-                    <h2 class="text-xl font-black">سجل المصروفات</h2>
-                    <p class="text-sm text-slate-400">تعديل أو حذف المصروفات المسجلة.</p>
-                </div>
-                <div class="rounded-2xl bg-rose-500/10 border border-rose-400/20 px-4 py-3 text-sm">
-                    الإجمالي: <span class="font-black text-rose-200">{{ total|money }}</span>
-                </div>
-            </div>
-
-            <div class="overflow-x-auto scrollbar-thin">
-                <table class="w-full text-sm min-w-[850px]">
-                    <thead>
-                        <tr class="table-head border-b border-slate-700/70">
-                            <th class="py-3 text-right">الوصف</th>
-                            <th class="py-3 text-right">التصنيف</th>
-                            <th class="py-3 text-right">المبلغ</th>
-                            <th class="py-3 text-right">التاريخ</th>
-                            <th class="py-3 text-right">إجراءات</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for exp in rows %}
-                        <tr class="border-b border-slate-800/70 align-top">
-                            <form method="post" action="{{ url_for('expense_update', expense_id=exp.id) }}">
-                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                <td class="py-3 pl-3"><input class="input" name="description" value="{{ exp.description }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" name="category" value="{{ exp.category }}"></td>
-                                <td class="py-3 pl-3"><input class="input" type="number" min="0" step="0.01" name="amount" value="{{ exp.amount }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" type="date" name="date" value="{{ exp.date[:10] }}" required></td>
-                                <td class="py-3">
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-muted py-2 px-3"><i class="fa-solid fa-floppy-disk"></i></button>
-                            </form>
-                                        <form method="post" action="{{ url_for('expense_delete', expense_id=exp.id) }}" onsubmit="return confirmDelete('حذف هذا المصروف؟')">
-                                            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                            <button class="btn btn-danger py-2 px-3"><i class="fa-solid fa-trash"></i></button>
-                                        </form>
-                                    </div>
-                                </td>
-                        </tr>
-                        {% else %}
-                        <tr><td colspan="5" class="py-10 text-center text-slate-500">لا توجد مصروفات بعد.</td></tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
+    <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto">
+    <table class="min-w-full text-sm"><thead class="bg-white/[.04]"><tr><th class="p-4 text-right">الوصف</th><th class="p-4 text-right">التصنيف</th><th class="p-4 text-right">المبلغ</th><th class="p-4 text-right">التاريخ</th><th></th></tr></thead>
+    <tbody>
+    {% for x in rows %}
+    <tr class="tr border-t border-white/5">
+    <form method="post" action="{{url_for('expense_update',id=x.id)}}">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <td class="p-3"><input name="description" value="{{x.description}}" class="soft w-72 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="category" value="{{x.category}}" class="soft w-40 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="amount" type="number" min="0" step="0.01" value="{{x.amount}}" class="soft w-36 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="date" type="date" value="{{x.date}}" class="soft w-40 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><div class="flex gap-2"><button class="rounded-xl bg-emerald-500/15 px-3 py-2 text-emerald-200"><i class="fa-solid fa-check"></i></button></form>
+    <form method="post" action="{{url_for('expense_delete',id=x.id)}}" onsubmit="return delmsg()"><input type="hidden" name="_csrf_token" value="{{csrf_token()}}"><button class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200"><i class="fa-solid fa-trash"></i></button></form></div></td>
+    </tr>
+    {% else %}<tr><td colspan="5" class="p-8 text-center text-slate-400">لا توجد مصروفات.</td></tr>{% endfor %}
+    </tbody></table></div></section>
     """
-    return render_page("المصروفات", "expenses", template, rows=rows, total=total, today=today)
+    return page("المصروفات", body, "expenses", rows=rows, total=total, today=today())
 
 
-@app.route("/expenses/create", methods=["POST"])
+@app.route("/expenses/<int:id>/update", methods=["POST"])
 @login_required
-def expense_create():
+def expense_update(id):
     try:
-        description = clean_text(request.form.get("description"), "الوصف", max_len=255)
-        category = clean_text(request.form.get("category"), "التصنيف", max_len=120, required=False)
-        amount = parse_money(request.form.get("amount"), "المبلغ", minimum=0)
-        date = clean_text(request.form.get("date"), "التاريخ", max_len=20)
         get_db().execute(
-            "INSERT INTO expenses (description, amount, category, date) VALUES (?, ?, ?, ?)",
-            (description, amount, category, date),
+            "UPDATE expenses SET description=?,category=?,amount=?,date=? WHERE id=?",
+            (
+                clean(request.form.get("description"), 220),
+                clean(request.form.get("category"), 120, False) or "عام",
+                amount(request.form.get("amount")),
+                request.form.get("date") or today(),
+                id,
+            ),
         )
-        get_db().commit()
-        flash("تم حفظ المصروف.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
-    return redirect(url_for("expenses"))
-
-
-@app.route("/expenses/<int:expense_id>/update", methods=["POST"])
-@login_required
-def expense_update(expense_id):
-    try:
-        description = clean_text(request.form.get("description"), "الوصف", max_len=255)
-        category = clean_text(request.form.get("category"), "التصنيف", max_len=120, required=False)
-        amount = parse_money(request.form.get("amount"), "المبلغ", minimum=0)
-        date = clean_text(request.form.get("date"), "التاريخ", max_len=20)
-        get_db().execute(
-            "UPDATE expenses SET description = ?, amount = ?, category = ?, date = ? WHERE id = ?",
-            (description, amount, category, date, expense_id),
-        )
-        get_db().commit()
         flash("تم تحديث المصروف.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
+    except Exception as e:
+        flash(str(e), "error")
     return redirect(url_for("expenses"))
 
 
-@app.route("/expenses/<int:expense_id>/delete", methods=["POST"])
+@app.route("/expenses/<int:id>/delete", methods=["POST"])
 @login_required
-def expense_delete(expense_id):
-    get_db().execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-    get_db().commit()
+def expense_delete(id):
+    get_db().execute("DELETE FROM expenses WHERE id=?", (id,))
     flash("تم حذف المصروف.", "success")
     return redirect(url_for("expenses"))
 
 
-@app.route("/customers")
+@app.route("/customers", methods=["GET", "POST"])
 @login_required
 def customers():
-    rows = get_db().execute("SELECT * FROM customers ORDER BY id DESC").fetchall()
-    statuses = ("قيد التنفيذ", "مكتمل")
+    if request.method == "POST":
+        try:
+            status = request.form.get("status") if request.form.get("status") in STATUSES else "قيد التنفيذ"
+            get_db().execute(
+                "INSERT INTO customers(name,phone,project_details,status) VALUES(?,?,?,?)",
+                (
+                    clean(request.form.get("name"), 160),
+                    clean(request.form.get("phone"), 80, False),
+                    clean(request.form.get("project_details"), 800, False),
+                    status,
+                ),
+            )
+            flash("تم حفظ العميل/المشروع.", "success")
+        except Exception as e:
+            flash(str(e), "error")
+        return redirect(url_for("customers"))
 
-    template = """
-    <div class="grid xl:grid-cols-3 gap-6">
-        <form method="post" action="{{ url_for('customer_create') }}" class="glass rounded-3xl p-6 shadow-soft">
-            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-            <h2 class="text-xl font-black mb-1">إضافة عميل / مشروع</h2>
-            <p class="text-sm text-slate-400 mb-5">تابع بيانات العملاء ومراحل التركيب.</p>
+    rows = qa("SELECT * FROM customers ORDER BY id DESC")
+    body = """
+    <section class="glass mb-6 rounded-3xl p-5"><h3 class="mb-4 font-black">إضافة عميل أو مشروع</h3>
+    <form method="post" class="grid gap-3 md:grid-cols-5">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <input name="name" required class="soft rounded-2xl px-4 py-3" placeholder="اسم العميل">
+    <input name="phone" class="soft rounded-2xl px-4 py-3" placeholder="الهاتف">
+    <input name="project_details" class="soft rounded-2xl px-4 py-3 md:col-span-2" placeholder="تفاصيل المشروع">
+    <select name="status" class="soft rounded-2xl px-4 py-3"><option>قيد التنفيذ</option><option>مكتمل</option></select>
+    <button class="gold rounded-2xl px-5 py-3 md:col-span-5">حفظ</button>
+    </form></section>
 
-            <div class="space-y-4">
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">اسم العميل</span>
-                    <input class="input mt-2" name="name" required maxlength="180">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">الهاتف</span>
-                    <input class="input mt-2" name="phone" maxlength="80">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">تفاصيل المشروع</span>
-                    <textarea class="input mt-2 min-h-32" name="project_details" placeholder="قدرة النظام، عدد الألواح، موقع التركيب..."></textarea>
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">الحالة</span>
-                    <select class="input mt-2" name="status">
-                        {% for status in statuses %}
-                        <option value="{{ status }}">{{ status }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <button class="btn btn-primary w-full"><i class="fa-solid fa-user-plus"></i> حفظ العميل</button>
-            </div>
-        </form>
-
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <div class="flex items-center justify-between mb-5">
-                <div>
-                    <h2 class="text-xl font-black">CRM العملاء والمشاريع</h2>
-                    <p class="text-sm text-slate-400">تحديث نطاق المشروع وحالة التركيب.</p>
-                </div>
-                <div class="rounded-2xl bg-slate-900/70 border border-slate-700/60 px-4 py-3 text-sm">
-                    العملاء: <span class="font-black text-sky-300">{{ rows|length }}</span>
-                </div>
-            </div>
-
-            <div class="space-y-4">
-                {% for customer in rows %}
-                <div class="rounded-3xl bg-slate-900/65 border border-slate-800 p-5">
-                    <form method="post" action="{{ url_for('customer_update', customer_id=customer.id) }}" class="grid md:grid-cols-2 gap-4">
-                        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                        <label>
-                            <span class="text-sm text-slate-300 font-bold">الاسم</span>
-                            <input class="input mt-2" name="name" value="{{ customer.name }}" required>
-                        </label>
-                        <label>
-                            <span class="text-sm text-slate-300 font-bold">الهاتف</span>
-                            <input class="input mt-2" name="phone" value="{{ customer.phone }}">
-                        </label>
-                        <label class="md:col-span-2">
-                            <span class="text-sm text-slate-300 font-bold">تفاصيل المشروع</span>
-                            <textarea class="input mt-2 min-h-24" name="project_details">{{ customer.project_details }}</textarea>
-                        </label>
-                        <label>
-                            <span class="text-sm text-slate-300 font-bold">الحالة</span>
-                            <select class="input mt-2" name="status">
-                                {% for status in statuses %}
-                                <option value="{{ status }}" {% if customer.status == status %}selected{% endif %}>{{ status }}</option>
-                                {% endfor %}
-                            </select>
-                        </label>
-                        <div class="flex items-end gap-2">
-                            <button class="btn btn-muted flex-1"><i class="fa-solid fa-floppy-disk"></i> تحديث</button>
-                    </form>
-                            <form method="post" action="{{ url_for('customer_delete', customer_id=customer.id) }}" onsubmit="return confirmDelete('حذف هذا العميل؟')" class="flex-1">
-                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                <button class="btn btn-danger w-full"><i class="fa-solid fa-trash"></i> حذف</button>
-                            </form>
-                        </div>
-                </div>
-                {% else %}
-                <div class="text-center text-slate-500 py-10">لا يوجد عملاء أو مشاريع بعد.</div>
-                {% endfor %}
-            </div>
-        </div>
-    </div>
+    <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto"><table class="min-w-full text-sm">
+    <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">العميل</th><th class="p-4 text-right">الهاتف</th><th class="p-4 text-right">المشروع</th><th class="p-4 text-right">الحالة</th><th></th></tr></thead>
+    <tbody>
+    {% for x in rows %}
+    <tr class="tr border-t border-white/5">
+    <form method="post" action="{{url_for('customer_update',id=x.id)}}">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <td class="p-3"><input name="name" value="{{x.name}}" class="soft w-48 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><input name="phone" value="{{x.phone}}" class="soft w-40 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><textarea name="project_details" class="soft w-96 rounded-xl px-3 py-2">{{x.project_details}}</textarea></td>
+    <td class="p-3"><select name="status" class="soft rounded-xl px-3 py-2"><option {{'selected' if x.status=='قيد التنفيذ' else ''}}>قيد التنفيذ</option><option {{'selected' if x.status=='مكتمل' else ''}}>مكتمل</option></select></td>
+    <td class="p-3"><div class="flex gap-2"><button class="rounded-xl bg-emerald-500/15 px-3 py-2 text-emerald-200"><i class="fa-solid fa-check"></i></button></form>
+    <form method="post" action="{{url_for('customer_delete',id=x.id)}}" onsubmit="return delmsg()"><input type="hidden" name="_csrf_token" value="{{csrf_token()}}"><button class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200"><i class="fa-solid fa-trash"></i></button></form></div></td>
+    </tr>
+    {% else %}<tr><td colspan="5" class="p-8 text-center text-slate-400">لا توجد مشاريع.</td></tr>{% endfor %}
+    </tbody></table></div></section>
     """
-    return render_page("العملاء والمشاريع", "customers", template, rows=rows, statuses=statuses)
+    return page("العملاء والمشاريع", body, "customers", rows=rows)
 
 
-@app.route("/customers/create", methods=["POST"])
+@app.route("/customers/<int:id>/update", methods=["POST"])
 @login_required
-def customer_create():
+def customer_update(id):
     try:
-        name = clean_text(request.form.get("name"), "اسم العميل", max_len=180)
-        phone = clean_text(request.form.get("phone"), "الهاتف", max_len=80, required=False)
-        project_details = clean_multiline(request.form.get("project_details"), "تفاصيل المشروع", required=False)
-        status = clean_text(request.form.get("status"), "الحالة", max_len=30)
-        if status not in ("مكتمل", "قيد التنفيذ"):
-            raise ValueError("حالة المشروع غير صحيحة.")
+        status = request.form.get("status") if request.form.get("status") in STATUSES else "قيد التنفيذ"
         get_db().execute(
-            "INSERT INTO customers (name, phone, project_details, status) VALUES (?, ?, ?, ?)",
-            (name, phone, project_details, status),
+            "UPDATE customers SET name=?,phone=?,project_details=?,status=? WHERE id=?",
+            (
+                clean(request.form.get("name"), 160),
+                clean(request.form.get("phone"), 80, False),
+                clean(request.form.get("project_details"), 800, False),
+                status,
+                id,
+            ),
         )
-        get_db().commit()
-        flash("تم حفظ العميل.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
+        flash("تم تحديث المشروع.", "success")
+    except Exception as e:
+        flash(str(e), "error")
     return redirect(url_for("customers"))
 
 
-@app.route("/customers/<int:customer_id>/update", methods=["POST"])
+@app.route("/customers/<int:id>/delete", methods=["POST"])
 @login_required
-def customer_update(customer_id):
-    try:
-        name = clean_text(request.form.get("name"), "اسم العميل", max_len=180)
-        phone = clean_text(request.form.get("phone"), "الهاتف", max_len=80, required=False)
-        project_details = clean_multiline(request.form.get("project_details"), "تفاصيل المشروع", required=False)
-        status = clean_text(request.form.get("status"), "الحالة", max_len=30)
-        if status not in ("مكتمل", "قيد التنفيذ"):
-            raise ValueError("حالة المشروع غير صحيحة.")
-        get_db().execute(
-            "UPDATE customers SET name = ?, phone = ?, project_details = ?, status = ? WHERE id = ?",
-            (name, phone, project_details, status, customer_id),
-        )
-        get_db().commit()
-        flash("تم تحديث بيانات العميل.", "success")
-    except ValueError as exc:
-        flash(str(exc), "error")
+def customer_delete(id):
+    get_db().execute("DELETE FROM customers WHERE id=?", (id,))
+    flash("تم حذف العميل/المشروع.", "success")
     return redirect(url_for("customers"))
 
 
-@app.route("/customers/<int:customer_id>/delete", methods=["POST"])
+@app.route("/users", methods=["GET", "POST"])
 @login_required
-def customer_delete(customer_id):
-    get_db().execute("DELETE FROM customers WHERE id = ?", (customer_id,))
-    get_db().commit()
-    flash("تم حذف العميل.", "success")
-    return redirect(url_for("customers"))
-
-
-@app.route("/users")
 @admin_required
 def users():
-    rows = get_db().execute("SELECT id, username, role FROM users ORDER BY id ASC").fetchall()
+    if request.method == "POST":
+        try:
+            role = request.form.get("role")
+            if role not in ROLES:
+                raise ValueError("الدور غير صالح.")
+            get_db().execute(
+                "INSERT INTO users(username,password,role) VALUES(?,?,?)",
+                (
+                    clean(request.form.get("username"), 80),
+                    generate_password_hash(clean(request.form.get("password"), 160)),
+                    role,
+                ),
+            )
+            flash("تمت إضافة المستخدم.", "success")
+        except sqlite3.IntegrityError:
+            flash("اسم المستخدم موجود مسبقاً.", "error")
+        except Exception as e:
+            flash(str(e), "error")
+        return redirect(url_for("users"))
 
-    template = """
-    <div class="grid xl:grid-cols-3 gap-6">
-        <form method="post" action="{{ url_for('user_create') }}" class="glass rounded-3xl p-6 shadow-soft">
-            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-            <h2 class="text-xl font-black mb-1">إضافة مستخدم</h2>
-            <p class="text-sm text-slate-400 mb-5">إدارة المستخدمين متاحة للمدير فقط.</p>
+    rows = qa("SELECT id,username,role FROM users ORDER BY id")
+    body = """
+    <section class="glass mb-6 rounded-3xl p-5"><h3 class="mb-4 font-black">إضافة مستخدم</h3>
+    <form method="post" class="grid gap-3 md:grid-cols-4">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <input name="username" required class="soft rounded-2xl px-4 py-3" placeholder="اسم المستخدم">
+    <input name="password" type="password" required class="soft rounded-2xl px-4 py-3" placeholder="كلمة المرور">
+    <select name="role" class="soft rounded-2xl px-4 py-3">{% for r in roles %}<option>{{r}}</option>{% endfor %}</select>
+    <button class="gold rounded-2xl px-5 py-3">إضافة</button>
+    </form></section>
 
-            <div class="space-y-4">
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">اسم المستخدم</span>
-                    <input class="input mt-2" name="username" required maxlength="80" autocomplete="off">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">كلمة المرور</span>
-                    <input class="input mt-2" type="password" name="password" required minlength="4" autocomplete="new-password">
-                </label>
-                <label>
-                    <span class="text-sm text-slate-300 font-bold">الدور</span>
-                    <select class="input mt-2" name="role">
-                        {% for role in roles %}
-                        <option value="{{ role }}">{{ role }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <button class="btn btn-primary w-full"><i class="fa-solid fa-user-plus"></i> إضافة المستخدم</button>
-            </div>
-        </form>
-
-        <div class="xl:col-span-2 glass rounded-3xl p-6 shadow-soft">
-            <div class="flex items-center justify-between mb-5">
-                <div>
-                    <h2 class="text-xl font-black">إدارة المستخدمين</h2>
-                    <p class="text-sm text-slate-400">إضافة، تعديل، أو حذف الحسابات وتحديد الصلاحيات.</p>
-                </div>
-            </div>
-
-            <div class="overflow-x-auto scrollbar-thin">
-                <table class="w-full text-sm min-w-[760px]">
-                    <thead>
-                        <tr class="table-head border-b border-slate-700/70">
-                            <th class="py-3 text-right">#</th>
-                            <th class="py-3 text-right">اسم المستخدم</th>
-                            <th class="py-3 text-right">كلمة مرور جديدة</th>
-                            <th class="py-3 text-right">الدور</th>
-                            <th class="py-3 text-right">إجراءات</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for row in rows %}
-                        <tr class="border-b border-slate-800/70 align-top">
-                            <form method="post" action="{{ url_for('user_update', user_id=row.id) }}">
-                                <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                <td class="py-3 font-bold">{{ row.id }}</td>
-                                <td class="py-3 pl-3"><input class="input" name="username" value="{{ row.username }}" required></td>
-                                <td class="py-3 pl-3"><input class="input" type="password" name="password" placeholder="اتركها فارغة لعدم التغيير" autocomplete="new-password"></td>
-                                <td class="py-3 pl-3">
-                                    <select class="input" name="role">
-                                        {% for role in roles %}
-                                        <option value="{{ role }}" {% if row.role == role %}selected{% endif %}>{{ role }}</option>
-                                        {% endfor %}
-                                    </select>
-                                </td>
-                                <td class="py-3">
-                                    <div class="flex gap-2">
-                                        <button class="btn btn-muted py-2 px-3"><i class="fa-solid fa-floppy-disk"></i></button>
-                            </form>
-                                        <form method="post" action="{{ url_for('user_delete', user_id=row.id) }}" onsubmit="return confirmDelete('حذف هذا المستخدم؟')">
-                                            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
-                                            <button class="btn btn-danger py-2 px-3" {% if row.id == current_user_id %}disabled title="لا يمكن حذف نفسك"{% endif %}><i class="fa-solid fa-trash"></i></button>
-                                        </form>
-                                    </div>
-                                </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
+    <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto"><table class="min-w-full text-sm">
+    <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">المستخدم</th><th class="p-4 text-right">الدور</th><th class="p-4 text-right">كلمة مرور جديدة</th><th></th></tr></thead>
+    <tbody>
+    {% for x in rows %}
+    <tr class="tr border-t border-white/5">
+    <form method="post" action="{{url_for('user_update',id=x.id)}}">
+    <input type="hidden" name="_csrf_token" value="{{csrf_token()}}">
+    <td class="p-3"><input name="username" value="{{x.username}}" class="soft w-48 rounded-xl px-3 py-2"></td>
+    <td class="p-3"><select name="role" class="soft rounded-xl px-3 py-2">{% for r in roles %}<option {{'selected' if x.role==r else ''}}>{{r}}</option>{% endfor %}</select></td>
+    <td class="p-3"><input name="password" type="password" class="soft w-56 rounded-xl px-3 py-2" placeholder="اختياري"></td>
+    <td class="p-3"><div class="flex gap-2"><button class="rounded-xl bg-emerald-500/15 px-3 py-2 text-emerald-200"><i class="fa-solid fa-check"></i></button></form>
+    <form method="post" action="{{url_for('user_delete',id=x.id)}}" onsubmit="return delmsg('هل تريد حذف المستخدم؟')"><input type="hidden" name="_csrf_token" value="{{csrf_token()}}"><button class="rounded-xl bg-red-500/15 px-3 py-2 text-red-200"><i class="fa-solid fa-trash"></i></button></form></div></td>
+    </tr>
+    {% endfor %}
+    </tbody></table></div></section>
     """
-    return render_page("إدارة المستخدمين", "users", template, rows=rows, roles=ROLES, current_user_id=current_user()["id"])
+    return page("إدارة المستخدمين", body, "users", rows=rows, roles=ROLES)
 
 
-@app.route("/users/create", methods=["POST"])
+@app.route("/users/<int:id>/update", methods=["POST"])
+@login_required
 @admin_required
-def user_create():
+def user_update(id):
     try:
-        username = clean_text(request.form.get("username"), "اسم المستخدم", max_len=80)
-        password = request.form.get("password") or ""
-        role = clean_text(request.form.get("role"), "الدور", max_len=30)
-        if len(password) < 4:
-            raise ValueError("كلمة المرور يجب ألا تقل عن 4 أحرف.")
+        role = request.form.get("role")
         if role not in ROLES:
-            raise ValueError("الدور غير صحيح.")
-
-        get_db().execute(
-            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-            (username, generate_password_hash(password), role),
-        )
-        get_db().commit()
-        flash("تم إنشاء المستخدم.", "success")
-    except sqlite3.IntegrityError:
-        flash("اسم المستخدم موجود مسبقاً.", "error")
-    except ValueError as exc:
-        flash(str(exc), "error")
-    return redirect(url_for("users"))
-
-
-@app.route("/users/<int:user_id>/update", methods=["POST"])
-@admin_required
-def user_update(user_id):
-    try:
-        username = clean_text(request.form.get("username"), "اسم المستخدم", max_len=80)
-        password = request.form.get("password") or ""
-        role = clean_text(request.form.get("role"), "الدور", max_len=30)
-        if role not in ROLES:
-            raise ValueError("الدور غير صحيح.")
-
-        target = get_db().execute("SELECT id, role FROM users WHERE id = ?", (user_id,)).fetchone()
-        if target is None:
-            abort(404)
-
-        admin_count = scalar("SELECT COUNT(*) FROM users WHERE role = ?", ("مدير",))
-        if target["role"] == "مدير" and role != "مدير" and admin_count <= 1:
-            raise ValueError("لا يمكن إزالة آخر مدير في النظام.")
+            raise ValueError("الدور غير صالح.")
+        if id == user()["id"] and role != "مدير":
+            raise ValueError("لا يمكنك إزالة صلاحية المدير من حسابك الحالي.")
+        username = clean(request.form.get("username"), 80)
+        password = (request.form.get("password") or "").strip()
 
         if password:
-            if len(password) < 4:
-                raise ValueError("كلمة المرور يجب ألا تقل عن 4 أحرف.")
             get_db().execute(
-                "UPDATE users SET username = ?, password = ?, role = ? WHERE id = ?",
-                (username, generate_password_hash(password), role, user_id),
+                "UPDATE users SET username=?,role=?,password=? WHERE id=?",
+                (username, role, generate_password_hash(password), id),
             )
         else:
             get_db().execute(
-                "UPDATE users SET username = ?, role = ? WHERE id = ?",
-                (username, role, user_id),
+                "UPDATE users SET username=?,role=? WHERE id=?",
+                (username, role, id),
             )
 
-        get_db().commit()
+        if id == user()["id"]:
+            session["user"].update(username=username, role=role)
+
         flash("تم تحديث المستخدم.", "success")
     except sqlite3.IntegrityError:
         flash("اسم المستخدم موجود مسبقاً.", "error")
-    except ValueError as exc:
-        flash(str(exc), "error")
+    except Exception as e:
+        flash(str(e), "error")
     return redirect(url_for("users"))
 
 
-@app.route("/users/<int:user_id>/delete", methods=["POST"])
+@app.route("/users/<int:id>/delete", methods=["POST"])
+@login_required
 @admin_required
-def user_delete(user_id):
-    if user_id == current_user()["id"]:
+def user_delete(id):
+    if id == user()["id"]:
         flash("لا يمكنك حذف حسابك الحالي.", "error")
         return redirect(url_for("users"))
 
-    target = get_db().execute("SELECT id, role FROM users WHERE id = ?", (user_id,)).fetchone()
-    if target is None:
-        abort(404)
+    target = q1("SELECT role FROM users WHERE id=?", (id,))
+    if target and target["role"] == "مدير" and q1("SELECT COUNT(*) c FROM users WHERE role='مدير'")["c"] <= 1:
+        flash("لا يمكن حذف آخر مدير.", "error")
+        return redirect(url_for("users"))
 
-    if target["role"] == "مدير":
-        admin_count = scalar("SELECT COUNT(*) FROM users WHERE role = ?", ("مدير",))
-        if admin_count <= 1:
-            flash("لا يمكن حذف آخر مدير في النظام.", "error")
-            return redirect(url_for("users"))
-
-    get_db().execute("DELETE FROM users WHERE id = ?", (user_id,))
-    get_db().commit()
+    get_db().execute("DELETE FROM users WHERE id=?", (id,))
     flash("تم حذف المستخدم.", "success")
     return redirect(url_for("users"))
 
 
 @app.errorhandler(400)
-def bad_request(error):
-    message = getattr(error, "description", "طلب غير صالح.")
-    return (
-        render_template_string(
-            """
-            <!doctype html>
-            <html lang="ar" dir="rtl">
-            <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>خطأ</title>
-                <script src="https://cdn.tailwindcss.com"></script>
-                <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap" rel="stylesheet">
-                <style>body{font-family:Cairo,sans-serif}</style>
-            </head>
-            <body class="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
-                <div class="max-w-lg w-full rounded-3xl bg-slate-900 border border-slate-700 p-8 text-center">
-                    <div class="text-5xl font-black text-rose-300 mb-3">400</div>
-                    <h1 class="text-2xl font-black mb-2">طلب غير صالح</h1>
-                    <p class="text-slate-400 mb-6">{{ message }}</p>
-                    <a href="{{ url_for('dashboard') if logged_in else url_for('login') }}" class="inline-flex rounded-2xl bg-sky-600 px-5 py-3 font-black">العودة</a>
-                </div>
-            </body>
-            </html>
-            """,
-            message=message,
-            logged_in=current_user() is not None,
-        ),
-        400,
-    )
+def e400(e):
+    tpl = """
+    <html lang="ar" dir="rtl"><meta charset="utf-8">
+    <body style="font-family:Tahoma;background:#070a12;color:white;display:grid;place-items:center;min-height:100vh">
+    <div><h1>طلب غير صالح</h1><p>{{ e.description }}</p><a style="color:#f5c451" href="{{ url_for('dashboard') if session.get('user') else url_for('login') }}">عودة</a></div>
+    </body></html>
+    """
+    return render_template_string(tpl, e=e), 400
 
 
 @app.errorhandler(403)
-def forbidden(_error):
-    if current_user():
-        return render_page(
-            "غير مصرح",
-            "",
-            """
-            <div class="max-w-xl mx-auto glass rounded-3xl p-8 text-center shadow-soft">
-                <div class="text-6xl text-rose-300 mb-4"><i class="fa-solid fa-ban"></i></div>
-                <h2 class="text-3xl font-black mb-3">غير مصرح</h2>
-                <p class="text-slate-400 mb-6">هذه الصفحة متاحة للمدير فقط.</p>
-                <a class="btn btn-primary" href="{{ url_for('dashboard') }}">العودة إلى لوحة التحكم</a>
-            </div>
-            """,
-        ), 403
-    return redirect(url_for("login"))
+def e403(_):
+    tpl = """
+    <html lang="ar" dir="rtl"><meta charset="utf-8">
+    <body style="font-family:Tahoma;background:#070a12;color:white;display:grid;place-items:center;min-height:100vh">
+    <div><h1>غير مصرح</h1><p>هذه الصفحة للمدير فقط.</p><a style="color:#f5c451" href="{{ url_for('dashboard') }}">لوحة التحكم</a></div>
+    </body></html>
+    """
+    return render_template_string(tpl), 403
 
 
 @app.errorhandler(404)
-def not_found(_error):
-    if current_user():
-        return render_page(
-            "غير موجود",
-            "",
-            """
-            <div class="max-w-xl mx-auto glass rounded-3xl p-8 text-center shadow-soft">
-                <div class="text-6xl text-sky-300 mb-4"><i class="fa-solid fa-circle-question"></i></div>
-                <h2 class="text-3xl font-black mb-3">الصفحة غير موجودة</h2>
-                <p class="text-slate-400 mb-6">الرابط المطلوب غير متاح.</p>
-                <a class="btn btn-primary" href="{{ url_for('dashboard') }}">العودة إلى لوحة التحكم</a>
-            </div>
-            """,
-        ), 404
-    return redirect(url_for("login"))
-
-
-with app.app_context():
-    init_db()
+def e404(_):
+    tpl = """
+    <html lang="ar" dir="rtl"><meta charset="utf-8">
+    <body style="font-family:Tahoma;background:#070a12;color:white;display:grid;place-items:center;min-height:100vh">
+    <div><h1>الصفحة غير موجودة</h1><a style="color:#f5c451" href="{{ url_for('dashboard') if session.get('user') else url_for('login') }}">عودة</a></div>
+    </body></html>
+    """
+    return render_template_string(tpl), 404
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=os.environ.get("FLASK_DEBUG", "0").lower() in {"1", "true", "yes"},
+    )
