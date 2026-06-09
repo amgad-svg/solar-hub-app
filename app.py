@@ -17,7 +17,7 @@ from flask import (
 from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 
-APP_NAME = "إدارة الطاقة الشمسية"
+APP_NAME = "Abu Haitham for Solar Energy"
 CURRENCY = "ج.س"
 ROLES = ("مدير", "محاسب", "فني تركيبات")
 STATUSES = ("قيد التنفيذ", "مكتمل")
@@ -429,7 +429,6 @@ body{background:radial-gradient(circle at 20% 0,rgba(245,196,81,.22),transparent
 <input name="username" class="soft mb-3 w-full rounded-2xl px-4 py-3" placeholder="اسم المستخدم" required>
 <input name="password" type="password" class="soft mb-4 w-full rounded-2xl px-4 py-3" placeholder="كلمة المرور" required>
 <button class="w-full rounded-2xl bg-yellow-400 py-3 font-black text-slate-950">دخول النظام</button>
-<p class="mt-5 text-center text-xs text-slate-400">amgad / 123456 · مدير</p>
 </form>
 </body>
 </html>
@@ -636,12 +635,50 @@ def inventory_delete(id):
 @app.route("/invoices")
 @login_required
 def invoices():
-    rows = qa("SELECT * FROM invoices ORDER BY id DESC")
+    q = clean(request.args.get("q"), 140, False)
+
+    if q:
+        like = f"%{q}%"
+        rows = qa("""
+        SELECT DISTINCT i.*
+        FROM invoices i
+        LEFT JOIN invoice_items ii ON ii.invoice_id = i.id
+        WHERE
+            CAST(i.id AS TEXT) LIKE ?
+            OR i.customer_name LIKE ?
+            OR COALESCE(i.customer_phone, '') LIKE ?
+            OR i.date LIKE ?
+            OR CAST(i.labor_cost AS TEXT) LIKE ?
+            OR CAST(i.expenses_cost AS TEXT) LIKE ?
+            OR CAST(i.grand_total AS TEXT) LIKE ?
+            OR COALESCE(ii.product_name, '') LIKE ?
+            OR CAST(COALESCE(ii.qty, 0) AS TEXT) LIKE ?
+            OR CAST(COALESCE(ii.price, 0) AS TEXT) LIKE ?
+            OR CAST(COALESCE(ii.cost, 0) AS TEXT) LIKE ?
+        ORDER BY i.id DESC
+        """, (like, like, like, like, like, like, like, like, like, like, like))
+    else:
+        rows = qa("SELECT * FROM invoices ORDER BY id DESC")
+
     body = """
     <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
     <div><h3 class="text-xl font-black">المبيعات والفواتير</h3><p class="text-sm text-slate-400">فواتير متعددة الأصناف مع خصم مباشر من المخزون.</p></div>
     <a class="gold rounded-2xl px-5 py-3" href="{{url_for('invoice_new')}}"><i class="fa-solid fa-plus ml-2"></i>فاتورة جديدة</a>
     </div>
+
+    <section class="glass mb-6 rounded-3xl p-5">
+    <form method="get" action="{{url_for('invoices')}}" class="grid gap-3 md:grid-cols-6">
+    <div class="relative md:col-span-5">
+    <i class="fa-solid fa-magnifying-glass absolute right-4 top-1/2 -translate-y-1/2 text-gold"></i>
+    <input name="q" value="{{q}}" class="soft w-full rounded-2xl py-3 pr-12 pl-4" placeholder="ابحث برقم الفاتورة، اسم العميل، الهاتف، التاريخ، المبلغ، المنتج، أو أي معلومة داخل الفاتورة...">
+    </div>
+    <button class="gold rounded-2xl px-5 py-3"><i class="fa-solid fa-search ml-2"></i>بحث</button>
+    {% if q %}<a class="rounded-2xl border border-white/10 bg-white/5 px-5 py-3 text-center font-bold text-slate-200 md:col-span-6" href="{{url_for('invoices')}}">إلغاء البحث وعرض كل الفواتير</a>{% endif %}
+    </form>
+    <div class="mt-3 flex flex-wrap items-center gap-2 text-sm text-slate-400">
+    {% if q %}<span>نتائج البحث عن: <b class="text-gold">{{q}}</b></span><span class="rounded-full bg-white/5 px-3 py-1">{{rows|length}} نتيجة</span>{% else %}<span>يعرض النظام جميع الفواتير، ويمكن البحث بأي جزء من بيانات الفاتورة أو منتجاتها.</span>{% endif %}
+    </div>
+    </section>
 
     <section class="glass overflow-hidden rounded-3xl"><div class="overflow-x-auto"><table class="min-w-full text-sm">
     <thead class="bg-white/[.04]"><tr><th class="p-4 text-right">#</th><th class="p-4 text-right">العميل</th><th class="p-4 text-right">الهاتف</th><th class="p-4 text-right">التاريخ</th><th class="p-4 text-right">الإجمالي</th><th class="p-4 text-right">تصدير</th></tr></thead>
@@ -659,10 +696,10 @@ def invoices():
     <a class="rounded-xl bg-sky-500/15 px-3 py-2 text-sky-200" target="_blank" href="{{url_for('invoice_print',invoice_id=i.id)}}">طباعة</a>
     </div></td>
     </tr>
-    {% else %}<tr><td colspan="6" class="p-8 text-center text-slate-400">لا توجد فواتير.</td></tr>{% endfor %}
+    {% else %}<tr><td colspan="6" class="p-8 text-center text-slate-400">لا توجد فواتير مطابقة للبحث.</td></tr>{% endfor %}
     </tbody></table></div></section>
     """
-    return page("المبيعات والفواتير", body, "invoices", rows=rows)
+    return page("المبيعات والفواتير", body, "invoices", rows=rows, q=q)
 
 
 @app.route("/invoices/new", methods=["GET", "POST"])
