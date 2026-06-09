@@ -1,3 +1,5 @@
-flask
+Flask
+Werkzeug
+MarkupSafe
+psycopg2-binary
 gunicorn
-openpyxl
